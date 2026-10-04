@@ -1,0 +1,296 @@
+#!/bin/sh
+#
+# fcc-pfctl: the only privileged command the deployment runs on the firewall.
+# Install it root-owned and not writable by anyone else, and let the
+# deployment account run exactly this path through doas. See the README.
+#
+# A deployment loads new rules into the running kernel only. /etc/pf.conf keeps
+# the previous policy until `commit`, so the watchdog, an explicit `rollback`,
+# or a reboot all restore the previous policy from the firewall itself.
+#
+# Every path below is fixed. Nothing the caller sends is used as a path, a
+# command, or an option; the only caller-supplied values are the rules on
+# standard input and the grace period, which must be a whole number of seconds.
+
+set -eu
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+umask 077
+
+PFCTL=/sbin/pfctl
+SHA256=/bin/sha256
+CONF=/etc/pf.conf
+DHCPD=/usr/sbin/dhcpd
+DHCPD_CONF=/etc/dhcpd.conf
+RCCTL=/usr/sbin/rcctl
+STATE=/var/db/fcc
+RUN=/var/run/fcc
+
+MINIMUM_GRACE=30
+MAXIMUM_GRACE=900
+MAXIMUM_BYTES=1048576
+
+fail() {
+	code=$1
+	shift
+	echo "fcc-pfctl: $*" >&2
+	exit "$code"
+}
+
+digest() {
+	echo "sha256:$("$SHA256" -q "$1")"
+}
+
+# A fingerprint of the rules the kernel is running right now. The digest of a
+# file says what was sent; only this says what is loaded. It covers the rules
+# as `pfctl -sr` lists them, not the contents of tables or anchors.
+running_rules() {
+	echo "sha256:$("$PFCTL" -sr | "$SHA256" -q)"
+}
+
+# Serializes every state-changing subcommand, including the watchdog, so a
+# rollback can never interleave with an apply or a commit.
+#
+# The watchdog passes "insist". It is the safety net, so once it has waited as
+# long as any other caller would, it takes the lock over rather than give up
+# and leave unconfirmed rules loaded.
+lock() {
+	attempts=0
+	until mkdir "$RUN/lock" 2>/dev/null; do
+		holder=$(cat "$RUN/lock/pid" 2>/dev/null || echo "")
+		if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+			rm -rf "$RUN/lock"
+			continue
+		fi
+		attempts=$((attempts + 1))
+		if [ "$attempts" -ge 150 ]; then
+			[ "${1:-}" = insist ] || fail 75 "another operation is in progress"
+			rm -rf "$RUN/lock"
+			attempts=0
+			continue
+		fi
+		sleep 0.2
+	done
+	echo "$$" >"$RUN/lock/pid"
+	trap unlock EXIT
+}
+
+# Only the holder releases the lock, so an operation that outlived a takeover
+# cannot release the lock of whoever replaced it.
+unlock() {
+	if [ "$(cat "$RUN/lock/pid" 2>/dev/null || echo "")" = "$$" ]; then
+		rm -rf "$RUN/lock"
+	fi
+}
+
+# Copies the rules on standard input to a root-only file and prints its path.
+read_candidate() {
+	candidate="$STATE/candidate.$$"
+	cat >"$candidate"
+	size=$(wc -c <"$candidate" | tr -d ' ')
+	if [ "$size" -eq 0 ] || [ "$size" -gt "$MAXIMUM_BYTES" ]; then
+		rm -f "$candidate"
+		fail 65 "candidate rules are empty or too large"
+	fi
+	echo "$candidate"
+}
+
+# Remembers which file was just loaded and what the kernel made of it, so that
+# `status` can tell whether the kernel is still running it.
+record_loaded() {
+	echo "$1 $(running_rules)" >"$STATE/loaded"
+}
+
+armed_token() {
+	[ -f "$RUN/armed" ] || return 1
+	cut -d' ' -f1 <"$RUN/armed"
+}
+
+# Reloads the committed policy and clears every trace of the deployment.
+restore_committed() {
+	"$PFCTL" -f "$CONF"
+	record_loaded "$(digest "$CONF")"
+	cp "$STATE/loaded" "$STATE/saved"
+	echo "$(date +%s) $1" >"$STATE/last_rollback"
+	rm -f "$RUN/armed" "$STATE/applied.conf"
+}
+
+[ "$(id -u)" -eq 0 ] || fail 77 "must run as root"
+mkdir -p "$STATE" "$RUN"
+chmod 700 "$STATE" "$RUN"
+
+command=${1:-}
+case "$command" in
+validate)
+	[ "$#" -eq 1 ] || fail 64 "validate takes no arguments"
+	candidate=$(read_candidate)
+	if ! "$PFCTL" -nf "$candidate"; then
+		rm -f "$candidate"
+		fail 65 "pfctl rejected the candidate rules"
+	fi
+	echo "candidate_sha256=$(digest "$candidate")"
+	rm -f "$candidate"
+	;;
+
+backup)
+	[ "$#" -eq 1 ] || fail 64 "backup takes no arguments"
+	lock
+	cp -p "$CONF" "$STATE/pf.conf.backup"
+	echo "committed_sha256=$(digest "$CONF")"
+	echo "backup_sha256=$(digest "$STATE/pf.conf.backup")"
+	;;
+
+arm)
+	[ "$#" -eq 2 ] || fail 64 "arm takes the grace period in seconds"
+	seconds=$2
+	case "$seconds" in
+	'' | *[!0-9]*) fail 64 "the grace period must be a whole number" ;;
+	esac
+	if [ "$seconds" -lt "$MINIMUM_GRACE" ] || [ "$seconds" -gt "$MAXIMUM_GRACE" ]; then
+		fail 64 "the grace period must be $MINIMUM_GRACE to $MAXIMUM_GRACE seconds"
+	fi
+	lock
+	[ ! -f "$RUN/armed" ] || fail 73 "a rollback watchdog is already armed"
+	token="$$-$(date +%s)"
+	echo "$token $(($(date +%s) + seconds))" >"$RUN/armed"
+	# Detached from this session, so losing SSH cannot stop it.
+	nohup "$0" watchdog "$token" "$seconds" </dev/null >/dev/null 2>&1 &
+	echo "armed=1"
+	;;
+
+watchdog)
+	[ "$#" -eq 3 ] || fail 64 "watchdog is started by arm"
+	token=$2
+	seconds=$3
+	case "$seconds" in
+	'' | *[!0-9]*) fail 64 "the grace period must be a whole number" ;;
+	esac
+	sleep "$seconds"
+	lock insist
+	# Only the watchdog that belongs to the current deployment may act; one
+	# left over from a deployment that already committed or rolled back finds
+	# a different token, or none.
+	if [ "$(armed_token || echo "")" = "$token" ]; then
+		restore_committed watchdog
+	fi
+	;;
+
+apply)
+	[ "$#" -eq 1 ] || fail 64 "apply takes no arguments"
+	candidate=$(read_candidate)
+	lock
+	if [ ! -f "$RUN/armed" ]; then
+		rm -f "$candidate"
+		fail 69 "refusing to apply without an armed rollback watchdog"
+	fi
+	if ! "$PFCTL" -nf "$candidate"; then
+		rm -f "$candidate"
+		fail 65 "pfctl rejected the candidate rules"
+	fi
+	mv -f "$candidate" "$STATE/applied.conf"
+	# Loads into the running kernel only; /etc/pf.conf is untouched.
+	"$PFCTL" -f "$STATE/applied.conf"
+	record_loaded "$(digest "$STATE/applied.conf")"
+	echo "loaded_sha256=$(digest "$STATE/applied.conf")"
+	;;
+
+commit)
+	[ "$#" -eq 1 ] || fail 64 "commit takes no arguments"
+	lock
+	[ -f "$RUN/armed" ] || fail 69 "nothing to commit: the watchdog is not armed"
+	[ -f "$STATE/applied.conf" ] || fail 69 "nothing to commit: no rules were applied"
+	cp -p "$CONF" "$CONF.fcc-previous"
+	cp "$STATE/applied.conf" "$CONF.fcc-new"
+	chmod 600 "$CONF.fcc-new"
+	"$PFCTL" -nf "$CONF.fcc-new"
+	# A rename within /etc, so /etc/pf.conf is always a complete file.
+	mv -f "$CONF.fcc-new" "$CONF"
+	# What `apply` recorded now describes /etc/pf.conf too. Kept apart from
+	# "loaded" so it survives the next apply, and a reboot is still recognized.
+	[ ! -f "$STATE/loaded" ] || cp "$STATE/loaded" "$STATE/saved"
+	rm -f "$RUN/armed" "$STATE/applied.conf"
+	echo "committed_sha256=$(digest "$CONF")"
+	;;
+
+rollback)
+	[ "$#" -eq 1 ] || fail 64 "rollback takes no arguments"
+	lock
+	restore_committed explicit
+	echo "committed_sha256=$(digest "$CONF")"
+	;;
+
+status)
+	[ "$#" -eq 1 ] || fail 64 "status takes no arguments"
+	if "$PFCTL" -si | grep -q '^Status: Enabled'; then
+		echo "pf=enabled"
+	else
+		echo "pf=disabled"
+	fi
+	if [ -f "$RUN/armed" ]; then
+		echo "armed=1"
+		echo "deadline=$(cut -d' ' -f2 <"$RUN/armed")"
+	else
+		echo "armed=0"
+		echo "deadline=0"
+	fi
+	echo "now=$(date +%s)"
+	committed=$(digest "$CONF")
+	echo "committed_sha256=$committed"
+	# Ask the kernel what it is running, and match that against what it ran
+	# right after this helper last loaded a file, and after /etc/pf.conf was
+	# last loaded. Rules that match neither were loaded by hand.
+	running=$(running_rules)
+	loaded=unknown
+	for record in "$STATE/loaded" "$STATE/saved"; do
+		[ -f "$record" ] || continue
+		read -r record_digest record_rules <"$record" || true
+		if [ "${record_rules:-}" = "$running" ]; then
+			loaded=${record_digest:-unknown}
+			break
+		fi
+	done
+	echo "loaded_sha256=$loaded"
+	if [ -f "$STATE/last_rollback" ]; then
+		echo "last_rollback=$(cat "$STATE/last_rollback")"
+	else
+		echo "last_rollback=none"
+	fi
+	if [ -f "$DHCPD_CONF" ]; then
+		echo "dhcpd_sha256=$(digest "$DHCPD_CONF")"
+	else
+		echo "dhcpd_sha256=none"
+	fi
+	;;
+
+dhcpd-apply)
+	# Unlike PF rules, a DHCP mistake cannot lock anyone out of the firewall,
+	# so there is no watchdog: the file is checked, then swapped in.
+	[ "$#" -eq 1 ] || fail 64 "dhcpd-apply takes no arguments"
+	candidate=$(read_candidate)
+	lock
+	if ! "$DHCPD" -n -c "$candidate"; then
+		rm -f "$candidate"
+		fail 65 "dhcpd rejected the configuration"
+	fi
+	if [ -f "$DHCPD_CONF" ]; then
+		cp -p "$DHCPD_CONF" "$DHCPD_CONF.fcc-previous"
+	fi
+	cp "$candidate" "$DHCPD_CONF.fcc-new"
+	chmod 644 "$DHCPD_CONF.fcc-new"
+	mv -f "$DHCPD_CONF.fcc-new" "$DHCPD_CONF"
+	rm -f "$candidate"
+	# Restart only a dhcpd that is already running; enabling the service is
+	# the administrator's decision.
+	if "$RCCTL" check dhcpd >/dev/null 2>&1; then
+		"$RCCTL" restart dhcpd >/dev/null
+		echo "dhcpd=restarted"
+	else
+		echo "dhcpd=not_running"
+	fi
+	echo "dhcpd_sha256=$(digest "$DHCPD_CONF")"
+	;;
+
+*)
+	fail 64 "usage: fcc-pfctl validate|backup|arm <seconds>|apply|commit|rollback|status|dhcpd-apply"
+	;;
+esac

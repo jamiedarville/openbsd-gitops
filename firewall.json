@@ -1,0 +1,8 @@
+{
+  "name": "my-firewall",
+  "host": "192.0.2.10",
+  "port": 22,
+  "user": "fccdeploy",
+  "helper": "/usr/local/sbin/fcc-pfctl",
+  "graceSeconds": 60
+}

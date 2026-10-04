@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+# fcc-gate: the only command the deployment key may run on the firewall.
+# install.sh names it as the forced command for that key, so sshd runs this
+# whatever the connection asked for, and hands over what it asked for in
+# SSH_ORIGINAL_COMMAND.
+#
+# It allows exactly `doas /usr/local/sbin/fcc-pfctl <operation>`, for the
+# operations a deployment uses, and nothing else: no shell and no other
+# command. The request is split into words and compared; it is never evaluated.
+
+set -eu
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+DOAS=/usr/bin/doas
+HELPER=/usr/local/sbin/fcc-pfctl
+
+refuse() {
+	echo "fcc-gate: only 'doas $HELPER <operation>' is allowed" >&2
+	exit 77
+}
+
+# Without globbing, so that a * in the request stays a *.
+set -f
+# shellcheck disable=SC2086
+set -- ${SSH_ORIGINAL_COMMAND:-}
+
+[ "${1:-}" = doas ] && [ "${2:-}" = "$HELPER" ] || refuse
+shift 2
+
+case "$#:${1:-}" in
+1:status | 1:validate | 1:backup | 1:apply | 1:commit | 1:rollback | 1:dhcpd-apply) ;;
+2:arm)
+	case "$2" in
+	'' | *[!0-9]*) refuse ;;
+	esac
+	;;
+*) refuse ;;
+esac
+
+exec "$DOAS" "$HELPER" "$@"

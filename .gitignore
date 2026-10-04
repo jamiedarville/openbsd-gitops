@@ -1,0 +1,6 @@
+.fw-local.json
+.env
+__pycache__/
+
+.vexp/
+.claude/

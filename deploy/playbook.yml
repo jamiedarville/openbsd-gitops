@@ -1,0 +1,181 @@
+# Ships the configuration in this repository to the firewall.
+#
+# Everything runs on the machine running Ansible; the firewall is reached only
+# through deploy/fw-helper, which calls the one privileged command the
+# deployment account is allowed to run. No Python is needed on the firewall.
+#
+# New rules are loaded into the running firewall first and saved only after a
+# fresh SSH connection still works. If they lock the deployment out, the
+# firewall restores its previous rules by itself when the grace period ends.
+
+- name: Deploy the firewall configuration
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    repo: "{{ playbook_dir }}/.."
+    settings: "{{ lookup('file', repo + '/firewall.json') | from_json }}"
+    grace: "{{ settings.graceSeconds | default(60) | int }}"
+    helper: "{{ playbook_dir }}/fw-helper"
+    work: "{{ lookup('env', 'FW_WORK_DIR') | default('/tmp', true) }}"
+    pf_file: "{{ work }}/pf.conf"
+    dhcp_file: "{{ repo }}/dhcp/dhcpd.conf"
+
+  environment:
+    FW_HOST: "{{ settings.host }}"
+    FW_PORT: "{{ settings.port | default(22) }}"
+    FW_USER: "{{ settings.user }}"
+    FW_HELPER: "{{ settings.helper | default('/usr/local/sbin/fcc-pfctl') }}"
+    PYTHONPATH: "{{ repo }}/tui"
+
+  tasks:
+    - name: Join the rule files into one pf.conf
+      ansible.builtin.shell: python3 -m fwgitops assemble > {{ pf_file | quote }}
+      args:
+        chdir: "{{ repo }}"
+      changed_when: false
+
+    - name: Work out the digest of the rules to deploy
+      ansible.builtin.stat:
+        path: "{{ pf_file }}"
+        checksum_algorithm: sha256
+      register: pf_stat
+
+    - name: Ask the firewall what it is running
+      ansible.builtin.command: "{{ helper }} status"
+      register: status_before
+      changed_when: false
+
+    - name: Read the firewall's answer
+      ansible.builtin.set_fact:
+        wanted: "sha256:{{ pf_stat.stat.checksum }}"
+        before: "{{ dict(status_before.stdout_lines | select('search', '=') | map('split', '=', 1)) }}"
+
+    - name: Stop if PF is switched off
+      ansible.builtin.assert:
+        that: before.pf == 'enabled'
+        fail_msg: PF is not enabled on the firewall.
+
+    - name: Stop if an earlier deployment is still waiting to be confirmed
+      ansible.builtin.assert:
+        that: before.armed == '0'
+        fail_msg: A rollback from an earlier deployment is still pending on the firewall. Try again after its grace period.
+
+    - name: Deploy the rules
+      when: before.committed_sha256 != wanted or before.loaded_sha256 != wanted
+      block:
+        - name: Have the firewall check the rules without loading them
+          ansible.builtin.shell: "{{ helper | quote }} validate < {{ pf_file | quote }}"
+          register: validated
+          changed_when: false
+
+        - name: Confirm the firewall received exactly these rules
+          ansible.builtin.assert:
+            that: validated.stdout is search(wanted)
+            fail_msg: The firewall received different bytes than were sent.
+
+        - name: Keep a copy of the current rules on the firewall
+          ansible.builtin.command: "{{ helper }} backup"
+
+        - name: Arm the firewall's rollback watchdog
+          ansible.builtin.command: "{{ helper }} arm {{ grace }}"
+          register: armed
+
+        - name: Note that rules are about to be loaded
+          ansible.builtin.file:
+            path: "{{ work }}/rules-were-loaded"
+            state: touch
+            mode: "0600"
+
+        - name: Load the new rules into the running firewall
+          ansible.builtin.shell: "{{ helper | quote }} apply < {{ pf_file | quote }}"
+
+        - name: Reconnect to prove the new rules still let us in
+          ansible.builtin.command: "{{ helper }} status"
+          register: status_applied
+          changed_when: false
+
+        - name: Confirm the firewall is running the new rules
+          ansible.builtin.assert:
+            that: status_applied.stdout is search('loaded_sha256=' + wanted)
+            fail_msg: The firewall is not running the rules that were sent.
+
+        - name: Save the new rules as the firewall's permanent configuration
+          ansible.builtin.command: "{{ helper }} commit"
+
+        - name: Confirm the firewall saved them
+          ansible.builtin.command: "{{ helper }} status"
+          register: status_after
+          changed_when: false
+          failed_when: status_after.stdout is not search('committed_sha256=' + wanted)
+
+      rescue:
+        - name: Undo the change
+          ansible.builtin.command: "{{ helper }} rollback"
+          register: rollback
+          ignore_errors: true
+          when: armed is defined and armed is not skipped
+
+        - name: Wait for the firewall to undo the change by itself
+          ansible.builtin.pause:
+            seconds: "{{ grace | int + 15 }}"
+          when: rollback is failed
+
+        - name: Ask the firewall what it is running now
+          ansible.builtin.command: "{{ helper }} status"
+          register: status_recovered
+          changed_when: false
+          ignore_errors: true
+
+        - name: Report the failed deployment
+          ansible.builtin.fail:
+            msg: >-
+              The deployment failed at "{{ ansible_failed_task.name }}".
+              {% if status_recovered is failed %}
+              The firewall cannot be reached, so what it is running is UNCONFIRMED. Check it at its console.
+              {% elif status_recovered.stdout is search('armed=0') and status_recovered.stdout is search('loaded_sha256=' + before.committed_sha256) %}
+              The firewall is back on its previous rules.
+              {% else %}
+              The firewall answered but is not on its previous rules. Check it.
+              {% endif %}
+
+    - name: Check whether there is a DHCP configuration to deploy
+      ansible.builtin.shell: grep -Eqv '^[[:space:]]*(#|$)' {{ dhcp_file | quote }}
+      register: dhcp_active
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy the DHCP configuration
+      when: dhcp_active.rc == 0
+      block:
+        - name: Work out the digest of the DHCP configuration
+          ansible.builtin.stat:
+            path: "{{ dhcp_file }}"
+            checksum_algorithm: sha256
+          register: dhcp_stat
+
+        - name: Stop if the firewall's helper is too old for DHCP
+          ansible.builtin.assert:
+            that: before.dhcpd_sha256 is defined
+            fail_msg: The helper installed on the firewall does not support DHCP. Reinstall target/fcc-pfctl.
+
+        - name: Install the DHCP configuration and restart dhcpd
+          ansible.builtin.shell: "{{ helper | quote }} dhcpd-apply < {{ dhcp_file | quote }}"
+          when: before.dhcpd_sha256 != 'sha256:' + dhcp_stat.stat.checksum
+
+      rescue:
+        # The deployer reads this to tell a DHCP failure, which it retries,
+        # from a failure of the rules, which it does not.
+        - name: Note that only the DHCP configuration failed
+          ansible.builtin.file:
+            path: "{{ work }}/dhcp-failed"
+            state: touch
+            mode: "0600"
+
+        - name: Report the failed DHCP deployment
+          ansible.builtin.fail:
+            msg: >-
+              The firewall rules are deployed, but the DHCP configuration was not installed:
+              "{{ ansible_failed_task.name }}" failed.
+              {{ ansible_failed_result.stderr | default(ansible_failed_result.msg | default(''), true) }}

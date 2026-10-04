@@ -1,0 +1,31 @@
+# The deployer. Copy .env.example to .env and fill it in first.
+services:
+  deployer:
+    build: deploy
+    image: openbsd-gitops-deployer:local
+    restart: unless-stopped
+    # Run as the user who owns the key files, so they stay readable only by them.
+    user: "${DEPLOY_UID:-1000}:${DEPLOY_GID:-1000}"
+    environment:
+      REPO_URL: ${REPO_URL}
+      BRANCH: ${BRANCH:-main}
+      INTERVAL: ${INTERVAL:-60}
+      FW_SSH_KEY: /keys/firewall_key
+      FW_KNOWN_HOSTS: /keys/firewall_known_hosts
+    volumes:
+      - fw-state:/state
+      - ${FW_SSH_KEY_FILE}:/keys/firewall_key:ro
+      - ${FW_KNOWN_HOSTS_FILE}:/keys/firewall_known_hosts:ro
+      # Only needed for a private repository cloned over SSH: the key, and the
+      # pinned host key of the Git server.
+      - ${GIT_SSH_KEY_FILE:-/dev/null}:/keys/git_key:ro
+      - ${GIT_KNOWN_HOSTS_FILE:-/dev/null}:/keys/git_known_hosts:ro
+      # Only needed when REPO_URL is a folder on this machine.
+      - ${LOCAL_REPO:-/dev/null}:${LOCAL_REPO:-/mnt/unused}:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  fw-state:

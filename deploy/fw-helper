@@ -1,0 +1,31 @@
+#!/bin/sh
+# Runs one operation of the firewall's privileged helper over SSH.
+#
+#   FW_HOST, FW_USER            where to connect
+#   FW_SSH_KEY, FW_KNOWN_HOSTS  the deployment key and the firewall's pinned host key
+#   FW_PORT, FW_HELPER          optional
+#
+# Every call is a new connection, pinned to the known host key, and ignores
+# any ssh_config on this machine.
+set -eu
+
+: "${FW_HOST:?FW_HOST is not set}"
+: "${FW_USER:?FW_USER is not set}"
+: "${FW_SSH_KEY:?FW_SSH_KEY is not set}"
+: "${FW_KNOWN_HOSTS:?FW_KNOWN_HOSTS is not set}"
+
+exec ssh -F /dev/null \
+	-o BatchMode=yes \
+	-o StrictHostKeyChecking=yes \
+	-o UserKnownHostsFile="$FW_KNOWN_HOSTS" \
+	-o GlobalKnownHostsFile=/dev/null \
+	-o IdentitiesOnly=yes \
+	-o ControlMaster=no \
+	-o ControlPath=none \
+	-o ForwardAgent=no \
+	-o ConnectTimeout=10 \
+	-o ServerAliveInterval=5 \
+	-o ServerAliveCountMax=3 \
+	-p "${FW_PORT:-22}" \
+	-i "$FW_SSH_KEY" \
+	-- "$FW_USER@$FW_HOST" doas "${FW_HELPER:-/usr/local/sbin/fcc-pfctl}" "$@"

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Opens the firewall editor, or runs one of its commands: assemble, check, status.
+here=$(cd "$(dirname "$0")" && pwd)
+cd "$here" && PYTHONPATH="$here/tui" exec python3 -m fwgitops "$@"
