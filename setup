@@ -1,0 +1,184 @@
+#!/bin/sh
+# Sets up the firewall and this machine in one step:
+#
+#   ./setup [-p port] [user@]firewall
+#
+# Name the firewall the way you would to ssh; a Host from your ssh_config works
+# too. The account must be able to log in over SSH and use doas there.
+#
+# Over one connection as that account it installs target/ on the firewall with
+# the deployment key, which it creates if there is none, and pins the
+# firewall's SSH host key. Then it fills in firewall.json, .fw-local.json and
+# .env, and proves the deployment key works.
+#
+# Safe to run again, for example to install a newer fcc-pfctl. It does not
+# change any PF rules and does not start the deployer.
+set -eu
+
+die() {
+	echo "setup: $*" >&2
+	exit 1
+}
+
+usage() {
+	echo "usage: ./setup [-p port] [user@]firewall" >&2
+	exit 64
+}
+
+port=
+while getopts p: option; do
+	case "$option" in
+	p) port=$OPTARG ;;
+	*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ "$#" -eq 1 ] || usage
+target=$1
+
+# Where this machine keeps the deployment key and the firewall's host key.
+KEY_DIR=${FW_KEY_DIR:-$HOME/fcc-runner}
+mkdir -p -m 700 "$KEY_DIR"
+KEY_DIR=$(cd "$KEY_DIR" && pwd)
+key=$KEY_DIR/id_ed25519
+known_hosts=$KEY_DIR/known_hosts
+
+cd "$(dirname "$0")"
+
+# Where ssh really connects once your ssh_config is applied. The deployer does
+# not read ssh_config, so firewall.json has to hold exactly this.
+resolved=$(ssh -T ${port:+-p "$port"} -G -- "$target") || die "ssh cannot make sense of '$target'"
+host=$(echo "$resolved" | awk '$1 == "hostname" { print $2 }')
+port=$(echo "$resolved" | awk '$1 == "port" { print $2 }')
+
+if [ ! -f "$key" ]; then
+	echo "Creating the deployment key $key"
+	ssh-keygen -q -t ed25519 -N '' -C openbsd-gitops-deploy -f "$key"
+fi
+# Worked out from the private key, so a stale .pub file cannot mislead.
+public=$(ssh-keygen -y -f "$key" | cut -d' ' -f1,2)
+case "$public" in
+ssh-ed25519\ * | ssh-rsa\ * | ecdsa-sha2-*\ *) ;;
+*) die "cannot read the deployment key $key" ;;
+esac
+
+tmp=$(mktemp -d)
+socket=$tmp/ssh
+remote=
+
+# Runs a command on the firewall as the administrator, over the connection
+# opened below. Never with a terminal, whatever ssh_config says, so what comes
+# back is exactly what the command printed.
+admin() {
+	ssh -S "$socket" -T -- "$target" "$@"
+}
+
+cleanup() {
+	[ -z "$remote" ] || admin "rm -rf $remote" </dev/null 2>/dev/null || true
+	ssh -S "$socket" -O exit -- "$target" 2>/dev/null || true
+	rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+# One connection, kept open for the steps below, so ssh asks for a password or
+# passphrase only once.
+echo "Connecting to $target"
+ssh -T -o ControlMaster=yes -o ControlPath="$socket" -o ControlPersist=300 -p "$port" -- "$target" true ||
+	die "could not log in to $target"
+[ "$(admin uname -s </dev/null)" = OpenBSD ] || die "$target is not running OpenBSD"
+
+echo "Installing the helper on the firewall"
+remote=$(admin mktemp -d /tmp/fcc-setup.XXXXXXXXXX </dev/null)
+for file in fcc-pfctl fcc-gate install.sh; do
+	admin "cat >$remote/$file" <"target/$file"
+done
+doas=doas
+[ "$(admin id -u </dev/null)" -ne 0 ] || doas=
+# With a terminal, because doas may ask for your password.
+ssh -S "$socket" -q -t -- "$target" "$doas sh $remote/install.sh '$public openbsd-gitops-deploy'" ||
+	die "the installation on the firewall failed"
+
+# Read over the connection that ssh has already verified, so there is no
+# fingerprint to compare by hand.
+host_key=$(admin cat /etc/ssh/ssh_host_ed25519_key.pub </dev/null | cut -d' ' -f1,2)
+case "$host_key" in
+ssh-ed25519\ *) ;;
+*) die "could not read the firewall's SSH host key" ;;
+esac
+pin=$host
+[ "$port" -eq 22 ] || pin="[$host]:$port"
+{
+	[ ! -f "$known_hosts" ] || awk -v pin="$pin" '$1 != pin' "$known_hosts"
+	echo "$pin $host_key"
+} >"$known_hosts.new"
+mv -f "$known_hosts.new" "$known_hosts"
+echo "Pinned the firewall's host key: $(echo "$pin $host_key" | ssh-keygen -lf -)"
+
+python3 - "$host" "$port" "$key" "$known_hosts" <<'EOF'
+import json
+import sys
+
+host, port, key, known_hosts = sys.argv[1:]
+with open("firewall.json") as file:
+    shared = json.load(file)
+wanted = {**shared, "host": host, "port": int(port)}
+if wanted != shared:
+    with open("firewall.json", "w") as file:
+        file.write(json.dumps(wanted, indent=2) + "\n")
+with open(".fw-local.json", "w") as file:
+    file.write(json.dumps({"identity": key, "knownHosts": known_hosts}, indent=2) + "\n")
+EOF
+
+# The same connection the deployer will make: the deployment key, the pinned
+# host key, no ssh_config. "different" is expected on a firewall that has never
+# been deployed to.
+echo "Asking the firewall for its status with the deployment key"
+answered=0
+./fw status || answered=$?
+case "$answered" in
+0 | 2) ;;
+*) die "the firewall is prepared, but the deployment key cannot use it. If its sshd_config has AllowUsers or AllowGroups, add fccdeploy." ;;
+esac
+
+if [ -f .env ]; then
+	echo "Keeping the .env that is already here"
+else
+	repo_url=$(git remote get-url origin 2>/dev/null || echo "")
+	# Only a repository cloned over SSH needs a key of its own.
+	case "$repo_url" in
+	'' | http://* | https://*) git_key='#' ;;
+	*) git_key= ;;
+	esac
+	cat >.env <<EOF
+# Written by ./setup. .env.example explains each line.
+REPO_URL=${repo_url:-git@github.com:YOUR-NAME/YOUR-REPO.git}
+BRANCH=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)
+INTERVAL=60
+
+FW_SSH_KEY_FILE=$key
+FW_KNOWN_HOSTS_FILE=$known_hosts
+
+# For a private repository; see "GitHub" in the README.
+${git_key}GIT_SSH_KEY_FILE=$HOME/.ssh/openbsd-gitops-deploy-key
+${git_key}GIT_KNOWN_HOSTS_FILE=$KEY_DIR/git_known_hosts
+
+DEPLOY_UID=$(id -u)
+DEPLOY_GID=$(id -g)
+EOF
+	echo "Wrote .env"
+fi
+
+echo
+echo "The firewall is ready. Before you start the deployer:"
+if ! git diff --quiet HEAD -- firewall.json 2>/dev/null; then
+	echo "  - firewall.json now names $host. Commit it and push:"
+	echo "      git commit -m 'Name the firewall' firewall.json && git push"
+fi
+if grep -Eq '^REPO_URL=.*YOUR-NAME|^GIT_SSH_KEY_FILE=' .env; then
+	echo "  - Give the deployer access to the repository: see \"GitHub\" in the README,"
+	echo "    and check REPO_URL in .env."
+fi
+echo "  - The first deployment replaces the rules the firewall has now with the ones"
+echo "    in this folder. Read them first: ./fw assemble"
+echo "Then: docker compose up -d --build"

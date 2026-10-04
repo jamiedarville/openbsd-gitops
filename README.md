@@ -25,6 +25,7 @@ Firewall configuration for an OpenBSD firewall, kept as plain text in Git.
 | `target/fcc-pfctl`           | The helper installed on the firewall.                                          |
 | `target/fcc-gate`            | The only command the deployment key may run on the firewall.                   |
 | `tui/`                       | The `./fw` editor.                                                             |
+| `setup`                      | Prepares a firewall and this machine in one step. See Setting it up.           |
 
 On OpenBSD, NAT is part of `pf.conf`, not a separate service. Every `*.conf`
 file in `firewall/` and `nat/` is joined in file-name order into one `pf.conf`,
@@ -92,48 +93,57 @@ stay in place and the DHCP configuration is tried again on every pass.
 
 ## Setting it up
 
-### 1. The firewall
+You need an account on the firewall that can log in over SSH and use `doas`.
 
-Copy `target/fcc-pfctl`, `target/fcc-gate` and `target/install.sh` to the
-firewall, then as root:
+### 1. GitHub
 
-```sh
-sh install.sh 'ssh-ed25519 AAAA... deploy-key-comment'
-```
-
-The argument is the public half of the deployment key. The script creates the
-`fccdeploy` account, installs the helper as `/usr/local/sbin/fcc-pfctl`, and
-adds one line to `/etc/doas.conf` that lets that account run that one command
-as root. It installs `/usr/local/sbin/fcc-gate` and ties the key to it, so the
-key can do nothing but call the helper. It does not change any PF rules.
-
-To update a firewall that is already set up, copy the three files again and
-run `sh install.sh` without an argument. That installs the newer helper and
-ties a key installed by an earlier version to the gate.
-
-### 2. This machine, for the editor's Check and Status
-
-Create `.fw-local.json` (it is not committed):
-
-```json
-{
-  "identity": "~/fcc-runner/id_ed25519",
-  "knownHosts": "~/fcc-runner/known_hosts"
-}
-```
-
-`knownHosts` is a file holding the firewall's SSH host key. Create it with
-`ssh-keyscan -t ed25519 FIREWALL > known_hosts` and compare the fingerprint
-(`ssh-keygen -lf known_hosts`) with the one shown on the firewall's console by
-`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
-
-### 3. GitHub
+Skip this if the repository is already there.
 
 ```sh
 gh repo create openbsd-gitops --private --source . --push
 ```
 
-For a private repository, give the deployer a read-only deploy key:
+### 2. The firewall and this machine
+
+```sh
+./setup admin@firewall.example.net
+```
+
+Name the firewall the way you would to `ssh`: an address, a name, or a `Host`
+from your `ssh_config`. `-p` gives a port. Everything on the firewall happens
+over one connection as that account, so `ssh` asks for a password at most once,
+and so does `doas`. The script:
+
+1. creates the deployment key, `~/fcc-runner/id_ed25519`, unless it exists;
+2. copies `target/` to the firewall and runs `install.sh` there as root;
+3. reads the firewall's SSH host key over that connection and pins it in
+   `~/fcc-runner/known_hosts`;
+4. writes the firewall's address into `firewall.json`, and writes
+   `.fw-local.json` and `.env`, which are not committed;
+5. runs `./fw status` with the deployment key, to prove the key works.
+
+It does not change any PF rules and does not start the deployer. Run it again
+to install a newer `target/` on a firewall that is already set up. Set
+`FW_KEY_DIR` to keep the keys somewhere other than `~/fcc-runner`.
+
+That connection is checked against your own `known_hosts`, like any other. If
+you have never connected to the firewall, `ssh` shows its fingerprint and asks;
+compare it with the one shown on the firewall's console by
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+
+`install.sh` creates the `fccdeploy` account, installs the helper as
+`/usr/local/sbin/fcc-pfctl`, and adds one line to `/etc/doas.conf` that lets
+that account run that one command as root. It installs
+`/usr/local/sbin/fcc-gate` and ties the key to it, so the key can do nothing
+but call the helper.
+
+The deployer reads the firewall's address from `firewall.json`, so commit that
+file and push it.
+
+### 3. A private repository
+
+Skip this if the repository is public. Give the deployer a read-only deploy
+key:
 
 ```sh
 ssh-keygen -t ed25519 -N '' -C openbsd-gitops-deployer -f ~/.ssh/openbsd-gitops-deploy-key
@@ -141,20 +151,20 @@ gh repo deploy-key add ~/.ssh/openbsd-gitops-deploy-key.pub --title deployer
 ```
 
 The deployer only clones over SSH from a server whose host key it was given.
-Fetch GitHub's, over HTTPS, into the file that `GIT_KNOWN_HOSTS_FILE` in `.env`
-points to:
+Fetch GitHub's, over HTTPS:
 
 ```sh
 gh api meta --jq '.ssh_keys[] | "github.com " + .' > ~/fcc-runner/git_known_hosts
 ```
 
+In `.env`, `REPO_URL` must be the SSH address, `git@github.com:NAME/REPO.git`,
+and the two `GIT_` lines must not start with `#`.
+
 ### 4. The deployer
 
-```sh
-cp .env.example .env
-```
-
-Fill in `.env`, then:
+`./setup` wrote `.env`; `.env.example` explains each line. The first deployment
+replaces the rules the firewall has now with the ones in this repository, so
+read `./fw assemble` first. Then:
 
 ```sh
 docker compose up -d --build
@@ -169,6 +179,43 @@ What it last did is in its state volume:
 docker compose exec deployer cat /state/status.json
 docker compose exec deployer cat /state/last-deploy.log
 ```
+
+### Without `./setup`
+
+Step 2 by hand. Create the deployment key:
+
+```sh
+mkdir -p -m 700 ~/fcc-runner
+ssh-keygen -t ed25519 -N '' -C openbsd-gitops-deploy -f ~/fcc-runner/id_ed25519
+```
+
+Copy `target/fcc-pfctl`, `target/fcc-gate` and `target/install.sh` to the
+firewall, then as root, with the public half of that key as the argument:
+
+```sh
+sh install.sh 'ssh-ed25519 AAAA... openbsd-gitops-deploy'
+```
+
+To update a firewall that is already set up, copy the three files again and
+run `sh install.sh` without an argument. That installs the newer helper and
+ties a key installed by an earlier version to the gate.
+
+Put the firewall's address in `firewall.json`, and create `.fw-local.json` for
+the editor's Check and Status:
+
+```json
+{
+  "identity": "~/fcc-runner/id_ed25519",
+  "knownHosts": "~/fcc-runner/known_hosts"
+}
+```
+
+`knownHosts` is a file holding the firewall's SSH host key. Create it with
+`ssh-keyscan -t ed25519 FIREWALL > known_hosts` and compare the fingerprint
+(`ssh-keygen -lf known_hosts`) with the one shown on the firewall's console by
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+
+Then copy `.env.example` to `.env` and fill it in.
 
 ## Recovering by hand
 
@@ -201,7 +248,9 @@ The PF operations were proven on OpenBSD 7.9, including recovery from a
 deliberate lockout. `dhcpd-apply` has not been run on OpenBSD yet. Neither have
 `fcc-gate`, the check of the running rules in `status`, or the watchdog taking
 over a stuck lock: those were only run against stand-ins for `pfctl` and
-`doas` on Linux.
+`doas` on Linux. `./setup` has not been run against OpenBSD either: it was
+run against a Linux container with OpenSSH's `sshd` and the portable `doas`,
+and stand-ins for `pfctl`, `sha256`, `uname` and `useradd`.
 
 ## Tests
 
