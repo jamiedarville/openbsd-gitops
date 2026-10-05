@@ -1,0 +1,12 @@
+{
+  "name": "my-monitoring",
+  "host": "192.0.2.20",
+  "port": 22,
+  "user": "fccmon",
+  "retentionDays": 30,
+  "versions": {
+    "prometheus": "v3.15.0",
+    "grafana": "13.2.3",
+    "nodeExporter": "v1.12.1"
+  }
+}

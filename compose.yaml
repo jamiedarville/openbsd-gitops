@@ -27,5 +27,41 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # The monitoring deployer: the same build and loop, applying
+  # deploy/monitoring.yml to the monitoring server. It has its own state and its
+  # own key, never the firewall's. ./setup-monitoring adds its lines to .env.
+  # Only started when asked for:
+  #   docker compose --profile monitoring up -d --build
+  monitoring-deployer:
+    build: deploy
+    # Its own name for the same build: two services cannot build one name.
+    image: openbsd-gitops-monitoring-deployer:local
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    user: "${DEPLOY_UID:-1000}:${DEPLOY_GID:-1000}"
+    environment:
+      REPO_URL: ${REPO_URL}
+      BRANCH: ${BRANCH:-main}
+      INTERVAL: ${MON_INTERVAL:-300}
+      PLAYBOOK: deploy/monitoring.yml
+      RETRY_POLICY: always
+      MON_SSH_KEY: /keys/monitoring_key
+      MON_KNOWN_HOSTS: /keys/monitoring_known_hosts
+      MON_SECRETS: /keys/monitoring-secrets.yml
+    volumes:
+      - mon-state:/state
+      - ${MON_SSH_KEY_FILE:-/dev/null}:/keys/monitoring_key:ro
+      - ${MON_KNOWN_HOSTS_FILE:-/dev/null}:/keys/monitoring_known_hosts:ro
+      - ${MON_SECRETS_FILE:-/dev/null}:/keys/monitoring-secrets.yml:ro
+      - ${GIT_SSH_KEY_FILE:-/dev/null}:/keys/git_key:ro
+      - ${GIT_KNOWN_HOSTS_FILE:-/dev/null}:/keys/git_known_hosts:ro
+      - ${LOCAL_REPO:-/dev/null}:${LOCAL_REPO:-/mnt/unused}:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   fw-state:
+  mon-state:

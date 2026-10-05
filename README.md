@@ -26,6 +26,9 @@ Firewall configuration for an OpenBSD firewall, kept as plain text in Git.
 | `target/fcc-gate`            | The only command the deployment key may run on the firewall.                   |
 | `tui/`                       | The `./fw` editor.                                                             |
 | `setup`                      | Prepares a firewall and this machine in one step. See Setting it up.           |
+| `monitoring.json`            | Which monitoring server this repository is for. See Monitoring.                |
+| `monitoring/`                | The monitoring stack's files, and the script that prepares its server.         |
+| `setup-monitoring`           | Prepares a monitoring server and this machine in one step.                     |
 
 On OpenBSD, NAT is part of `pf.conf`, not a separate service. Every `*.conf`
 file in `firewall/` and `nat/` is joined in file-name order into one `pf.conf`,
@@ -251,6 +254,110 @@ over a stuck lock: those were only run against stand-ins for `pfctl` and
 `doas` on Linux. `./setup` has not been run against OpenBSD either: it was
 run against a Linux container with OpenSSH's `sshd` and the portable `doas`,
 and stand-ins for `pfctl`, `sha256`, `uname` and `useradd`.
+
+## Monitoring
+
+Optional. A second deployer keeps a Linux server running Prometheus and
+Grafana, from this same repository and in the same way: the files are the
+configuration, and every change is a commit.
+
+So far the stack watches the monitoring server itself, with Prometheus, Grafana
+and node_exporter. It does not scrape the firewall yet.
+
+| Path                    | What it holds                                                        |
+| ----------------------- | -------------------------------------------------------------------- |
+| `monitoring.json`       | The server, how many days of data to keep, and each program's version. |
+| `monitoring/stack/`     | The stack: its compose file, the Prometheus configuration, and Grafana's data sources and dashboards. |
+| `monitoring/install.sh` | The script that prepares the server for the deployer.                |
+| `deploy/monitoring.yml` | The playbook, with its roles in `deploy/roles/`.                     |
+
+### Setting it up
+
+You need a server running Ubuntu 24.04, and an account on it that can log in
+over SSH and use `sudo`. Set up the firewall first; this adds to its `.env`.
+
+```sh
+./setup-monitoring admin@monitor.example.net
+```
+
+Name the server the way you would to `ssh`; `-p` gives a port. Over one
+connection as that account, the script:
+
+1. creates the monitoring key, `~/fcc-runner/monitoring_ed25519`, unless it
+   exists;
+2. runs `monitoring/install.sh` on the server as root, which creates the
+   `fccmon` account, installs the key for it, and lets it use `sudo` without a
+   password;
+3. reads the server's SSH host key over that connection and pins it in
+   `~/fcc-runner/monitoring_known_hosts`;
+4. writes the server's address into `monitoring.json`, adds three lines to
+   `.env`, and writes `~/fcc-runner/monitoring-secrets.yml` with a new password
+   for Grafana, unless that file exists;
+5. logs in with the monitoring key and becomes root, to prove the key works.
+
+The key is accepted from one address only: this machine's, as the server sees
+it. If that address can change, name a network with `-a`, for example
+`-a 192.168.1.0/24`. Run the script again to change it.
+
+Commit `monitoring.json` and push it. Then start its deployer beside the
+firewall's:
+
+```sh
+docker compose --profile monitoring up -d --build
+docker compose logs -f monitoring-deployer
+```
+
+On the server, the deployer:
+
+- installs `nftables` and `unattended-upgrades`, and a host firewall that lets
+  in SSH and ping and nothing else, replacing `/etc/nftables.conf`;
+- installs Docker from Docker's own package repository, replacing
+  `/etc/docker/daemon.json`;
+- puts the stack in `/opt/monitoring` and starts it.
+
+Everything in the stack listens on `127.0.0.1` only. Reach Grafana through an
+SSH tunnel, as `admin` with the password from `monitoring-secrets.yml`:
+
+```sh
+ssh -L 3000:127.0.0.1:3000 admin@monitor.example.net
+```
+
+and open `http://127.0.0.1:3000`. Grafana reads that password only when it
+first starts; after that, change it in Grafana.
+
+### Changing it
+
+Edit `monitoring.json` or the files in `monitoring/stack/`, commit, and push.
+The deployer looks for a new commit every `MON_INTERVAL` seconds (300 unless
+`.env` says otherwise), and on every pass puts back what was changed on the
+server by hand.
+
+- A file is checked by the program that will read it before it replaces the
+  one in use, so a commit with a broken Prometheus configuration leaves the
+  running one alone.
+- A deployment that fails is tried again on every pass, unlike a firewall
+  deployment: nothing here can lock anyone out of the firewall.
+- The versions in `monitoring.json` are exact, so an upgrade is a commit.
+- Dashboards cannot be changed in Grafana. Edit the file in
+  `monitoring/stack/grafana/dashboards/`; a file removed there is removed from
+  Grafana.
+
+Undo a change with `git revert <commit>` and push.
+
+### What the monitoring key allows
+
+Unlike the firewall's key, the monitoring key is not confined to one command:
+`fccmon` can become root on the monitoring server, because the deployer
+installs packages and runs Docker there. It is accepted from one address, and
+whoever can push to the branch decides what runs as root on that server.
+Protect the branch accordingly.
+
+The monitoring deployer is never given the firewall's key, and the monitoring
+server has no access to the firewall.
+
+All of this was run against a container standing in for an Ubuntu 24.04 server,
+with systemd, `sshd`, `sudo` and Docker inside it. It has not been run against
+a real server yet.
 
 ## Tests
 

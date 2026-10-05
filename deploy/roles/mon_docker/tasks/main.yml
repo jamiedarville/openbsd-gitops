@@ -1,0 +1,72 @@
+# Docker and its compose plugin, from Docker's own package repository.
+
+- name: Install what fetching Docker's signing key needs
+  ansible.builtin.apt:
+    name: ca-certificates
+    state: present
+
+- name: Make a place for Docker's signing key
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Fetch Docker's signing key
+  ansible.builtin.get_url:
+    url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+
+- name: Ask which architecture this server's packages are for
+  ansible.builtin.command: dpkg --print-architecture
+  register: package_architecture
+  changed_when: false
+
+- name: Add Docker's package repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/docker.list
+    content: >
+      deb [arch={{ package_architecture.stdout }} signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/{{ ansible_distribution | lower }}
+      {{ ansible_distribution_release }} stable
+    mode: "0644"
+
+# Asked on every pass, so a refresh that failed last time is tried again.
+- name: See whether the package lists know Docker yet
+  ansible.builtin.command: apt-cache policy docker-ce
+  register: docker_candidate
+  changed_when: false
+
+- name: Install Docker and its compose plugin
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+    update_cache: "{{ 'Candidate: ' not in docker_candidate.stdout or 'Candidate: (none)' in docker_candidate.stdout }}"
+
+- name: Configure the Docker daemon
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "10m", "max-file": "3" },
+        "live-restore": true
+      }
+    mode: "0644"
+  register: docker_daemon
+
+- name: Restart Docker with its new configuration
+  ansible.builtin.systemd_service:
+    name: docker
+    state: restarted
+  when: docker_daemon is changed
+
+- name: Run Docker now and at boot
+  ansible.builtin.systemd_service:
+    name: docker
+    state: started
+    enabled: true

@@ -1,0 +1,124 @@
+# The monitoring stack: monitoring/stack in the repository becomes
+# {{ stack_dir }} on the server. A file is checked by the program that will
+# read it before it replaces the one in use, and nothing here depends on having
+# noticed a change during this run, so a pass that failed halfway is completed
+# by the next one.
+
+- name: Make the stack's folders
+  ansible.builtin.file:
+    path: "{{ stack_dir }}/{{ item.path }}"
+    state: directory
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "", mode: "0755" }
+    - { path: prometheus, mode: "0755" }
+    - { path: grafana, mode: "0755" }
+    - { path: secrets, mode: "0700" }
+  loop_control:
+    label: "{{ stack_dir }}/{{ item.path }}"
+
+# Grafana reads this when it first starts. After that the password lives in
+# Grafana's own database and is changed there. 472 is the user its image runs
+# as.
+- name: Install Grafana's first administrator password
+  ansible.builtin.copy:
+    dest: "{{ stack_dir }}/secrets/grafana_admin_password"
+    content: "{{ grafana_admin_password }}"
+    owner: "472"
+    group: root
+    mode: "0400"
+  no_log: true
+
+- name: Install the Prometheus configuration
+  ansible.builtin.template:
+    src: "{{ stack_source }}/prometheus/prometheus.yml.j2"
+    dest: "{{ stack_dir }}/prometheus/prometheus.yml"
+    mode: "0644"
+    validate: >-
+      docker run --rm --user 0 --network none --entrypoint promtool
+      -v %s:/check/prometheus.yml:ro
+      prom/prometheus:{{ monitoring.versions.prometheus }}
+      check config /check/prometheus.yml
+
+- name: Install Grafana's provisioning and dashboards
+  ansible.builtin.copy:
+    src: "{{ stack_source }}/grafana/"
+    dest: "{{ stack_dir }}/grafana/"
+    mode: "0644"
+    directory_mode: "0755"
+
+- name: List what the server holds for Grafana
+  ansible.builtin.find:
+    paths: "{{ stack_dir }}/grafana"
+    recurse: true
+  register: grafana_installed
+
+- name: Remove what is no longer in the repository
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ grafana_installed.files | map(attribute='path') | list }}"
+  when: item | relpath(stack_dir + '/grafana') not in grafana_wanted
+  vars:
+    grafana_wanted: >-
+      {{ query('community.general.filetree', stack_source + '/grafana')
+         | selectattr('state', 'eq', 'file') | map(attribute='path') | list }}
+
+- name: Install the stack's compose file
+  ansible.builtin.template:
+    src: "{{ stack_source }}/compose.yaml.j2"
+    dest: "{{ stack_dir }}/compose.yaml"
+    mode: "0644"
+    validate: docker compose -f %s config --quiet
+
+- name: Start the stack, or bring it in line with its compose file
+  community.docker.docker_compose_v2:
+    project_src: "{{ stack_dir }}"
+    remove_orphans: true
+
+- name: Wait for Prometheus
+  ansible.builtin.uri:
+    url: http://127.0.0.1:9090/-/ready
+  register: prometheus_ready
+  until: prometheus_ready.status == 200
+  retries: 30
+  delay: 2
+
+- name: Look at the Prometheus configuration file
+  ansible.builtin.stat:
+    path: "{{ stack_dir }}/prometheus/prometheus.yml"
+  register: prometheus_file
+
+- name: Ask Prometheus when it last read its configuration
+  ansible.builtin.uri:
+    url: http://127.0.0.1:9090/metrics
+    return_content: true
+  register: prometheus_metrics
+
+- name: Have Prometheus read a configuration newer than that
+  ansible.builtin.uri:
+    url: http://127.0.0.1:9090/-/reload
+    method: POST
+  changed_when: true
+  when: >-
+    prometheus_file.stat.mtime > prometheus_metrics.content
+    | regex_findall('(?m)^prometheus_config_last_reload_success_timestamp_seconds (\\S+)')
+    | first | float
+
+- name: Wait for Grafana
+  ansible.builtin.uri:
+    url: http://127.0.0.1:3000/api/health
+  register: grafana_health
+  until: grafana_health.status == 200
+  retries: 30
+  delay: 2
+
+- name: Check that Prometheus reaches everything it scrapes
+  ansible.builtin.uri:
+    url: http://127.0.0.1:9090/api/v1/query?query=up
+  register: scraped
+  until: >-
+    scraped.status == 200 and scraped.json.data.result | length > 0
+    and scraped.json.data.result | map(attribute='value') | map('last') | unique | list == ['1']
+  retries: 24
+  delay: 5

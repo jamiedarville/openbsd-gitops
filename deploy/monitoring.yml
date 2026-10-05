@@ -1,0 +1,84 @@
+# Configures the monitoring server from monitoring.json and monitoring/.
+#
+# Run by the monitoring-deployer service in compose.yaml, in the same loop as
+# the firewall's playbook but with every failure retried: nothing here can lock
+# anyone out of the firewall.
+#
+# The server is reached over SSH as the account ./setup-monitoring made, with
+# the key and the pinned host key that are mounted into the container. To undo
+# a change, revert the commit.
+
+- name: Read the settings
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    repo: "{{ playbook_dir }}/.."
+    monitoring: "{{ lookup('file', repo + '/monitoring.json') | from_json }}"
+    key: "{{ lookup('env', 'MON_SSH_KEY') | default('/keys/monitoring_key', true) }}"
+    known_hosts: "{{ lookup('env', 'MON_KNOWN_HOSTS') | default('/keys/monitoring_known_hosts', true) }}"
+    secrets: "{{ lookup('env', 'MON_SECRETS') | default('/keys/monitoring-secrets.yml', true) }}"
+
+  tasks:
+    - name: Look for the key, the pinned host key and the secrets
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ key }}"
+        - "{{ known_hosts }}"
+        - "{{ secrets }}"
+      register: mounted
+
+    - name: Stop if one of them is not there
+      ansible.builtin.assert:
+        that: item.stat.exists and item.stat.size | default(0) > 0
+        fail_msg: "{{ item.item }} is missing or empty. Run ./setup-monitoring, and check the MON_ lines in .env."
+        quiet: true
+      loop: "{{ mounted.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Stop if a dashboard is not valid JSON
+      ansible.builtin.assert:
+        that: (lookup('file', item) | from_json).title is defined
+        fail_msg: "{{ item | basename }} is not a dashboard."
+        quiet: true
+      with_fileglob: "{{ repo }}/monitoring/stack/grafana/dashboards/*.json"
+      loop_control:
+        label: "{{ item | basename }}"
+
+    # Pinned to the known host key and blind to any ssh_config, like the
+    # firewall's helper.
+    - name: Name the monitoring server
+      ansible.builtin.add_host:
+        name: monitoring-server
+        ansible_host: "{{ monitoring.host }}"
+        ansible_port: "{{ monitoring.port | default(22) }}"
+        ansible_user: "{{ monitoring.user }}"
+        ansible_ssh_private_key_file: "{{ key }}"
+        ansible_ssh_common_args: >-
+          -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=yes
+          -o UserKnownHostsFile={{ known_hosts }} -o GlobalKnownHostsFile=/dev/null
+          -o IdentitiesOnly=yes -o ConnectTimeout=10
+        ansible_ssh_pipelining: true
+        ansible_python_interpreter: /usr/bin/python3
+      changed_when: false
+
+- name: Configure the monitoring server
+  hosts: monitoring-server
+  become: true
+
+  vars:
+    repo: "{{ playbook_dir }}/.."
+    monitoring: "{{ lookup('file', repo + '/monitoring.json') | from_json }}"
+    stack_source: "{{ repo }}/monitoring/stack"
+    stack_dir: /opt/monitoring
+
+  vars_files:
+    - "{{ lookup('env', 'MON_SECRETS') | default('/keys/monitoring-secrets.yml', true) }}"
+
+  roles:
+    - mon_base
+    - mon_docker
+    - mon_stack

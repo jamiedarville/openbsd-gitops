@@ -1,0 +1,66 @@
+# The monitoring stack, written by openbsd-gitops from monitoring/stack in the
+# repository. Changes made here are overwritten.
+#
+# Everything uses the host's network and listens on 127.0.0.1 only, so the
+# host firewall decides what can be reached and Docker publishes nothing
+# around it. Reach Grafana through an SSH tunnel.
+name: monitoring
+
+services:
+  prometheus:
+    image: prom/prometheus:{{ monitoring.versions.prometheus }}
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time={{ monitoring.retentionDays | default(30) }}d
+      - --web.listen-address=127.0.0.1:9090
+      # Lets the deployer ask for a reload after it changes the configuration.
+      - --web.enable-lifecycle
+    volumes:
+      - {{ stack_dir }}/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:{{ monitoring.versions.grafana }}
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    labels:
+      # Grafana reads its provisioning only when it starts. This changes with
+      # the provisioning, which makes compose start it again.
+      fcc.provisioning: "{{ lookup('ansible.builtin.file', *(query('community.general.filetree', stack_source + '/grafana/provisioning') | selectattr('state', 'eq', 'file') | map(attribute='src') | sort), wantlist=True) | join | hash('sha1') }}"
+    secrets:
+      - grafana_admin_password
+    volumes:
+      - {{ stack_dir }}/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - {{ stack_dir }}/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - {{ stack_dir }}/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+  # On the host's network and process list, and reading the host's files, so
+  # that what it reports is the server and not its own container.
+  node-exporter:
+    image: prom/node-exporter:{{ monitoring.versions.nodeExporter }}
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --web.listen-address=127.0.0.1:9100
+    volumes:
+      - /:/host:ro,rslave
+
+secrets:
+  grafana_admin_password:
+    file: {{ stack_dir }}/secrets/grafana_admin_password
+
+volumes:
+  prometheus-data:
+  grafana-data:

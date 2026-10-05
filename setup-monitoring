@@ -1,0 +1,195 @@
+#!/bin/sh
+# Sets up the monitoring server and this machine in one step:
+#
+#   ./setup-monitoring [-p port] [-a address] [user@]server
+#
+# Name the server the way you would to ssh; a Host from your ssh_config works
+# too. The account must be able to log in over SSH and use sudo there. Run
+# ./setup for the firewall first: this adds to the .env that it writes.
+#
+# Over one connection as that account it runs monitoring/install.sh on the
+# server with the monitoring key, which it creates if there is none, and pins
+# the server's SSH host key. Then it fills in monitoring.json and .env, makes
+# the file of secrets if there is none, and proves the monitoring key works.
+#
+# The monitoring key is only accepted from one address: this machine's, as the
+# server sees it, unless -a names another address, network or pattern.
+#
+# Safe to run again. It installs nothing but that account on the server; the
+# monitoring deployer does the rest.
+set -eu
+
+die() {
+	echo "setup-monitoring: $*" >&2
+	exit 1
+}
+
+usage() {
+	echo "usage: ./setup-monitoring [-p port] [-a address] [user@]server" >&2
+	exit 64
+}
+
+port=
+allowed=
+while getopts p:a: option; do
+	case "$option" in
+	p) port=$OPTARG ;;
+	a) allowed=$OPTARG ;;
+	*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ "$#" -eq 1 ] || usage
+target=$1
+
+# Beside the firewall's key, where this machine keeps such things.
+KEY_DIR=${FW_KEY_DIR:-$HOME/fcc-runner}
+mkdir -p -m 700 "$KEY_DIR"
+KEY_DIR=$(cd "$KEY_DIR" && pwd)
+key=$KEY_DIR/monitoring_ed25519
+known_hosts=$KEY_DIR/monitoring_known_hosts
+secrets=$KEY_DIR/monitoring-secrets.yml
+
+cd "$(dirname "$0")"
+[ -f .env ] || die "there is no .env here. Run ./setup for the firewall first."
+
+# Where ssh really connects once your ssh_config is applied. The deployer does
+# not read ssh_config, so monitoring.json has to hold exactly this.
+resolved=$(ssh -T ${port:+-p "$port"} -G -- "$target") || die "ssh cannot make sense of '$target'"
+host=$(echo "$resolved" | awk '$1 == "hostname" { print $2 }')
+port=$(echo "$resolved" | awk '$1 == "port" { print $2 }')
+
+if [ ! -f "$key" ]; then
+	echo "Creating the monitoring key $key"
+	ssh-keygen -q -t ed25519 -N '' -C openbsd-gitops-monitoring -f "$key"
+fi
+# Worked out from the private key, so a stale .pub file cannot mislead.
+public=$(ssh-keygen -y -f "$key" | cut -d' ' -f1,2)
+case "$public" in
+ssh-ed25519\ * | ssh-rsa\ * | ecdsa-sha2-*\ *) ;;
+*) die "cannot read the monitoring key $key" ;;
+esac
+
+tmp=$(mktemp -d)
+socket=$tmp/ssh
+remote=
+
+# Runs a command on the server as the administrator, over the connection
+# opened below. Never with a terminal, whatever ssh_config says, so what comes
+# back is exactly what the command printed.
+admin() {
+	ssh -S "$socket" -T -- "$target" "$@"
+}
+
+cleanup() {
+	[ -z "$remote" ] || admin "rm -rf $remote" </dev/null 2>/dev/null || true
+	ssh -S "$socket" -O exit -- "$target" 2>/dev/null || true
+	rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+# One connection, kept open for the steps below, so ssh asks for a password or
+# passphrase only once.
+echo "Connecting to $target"
+ssh -T -o ControlMaster=yes -o ControlPath="$socket" -o ControlPersist=300 -p "$port" -- "$target" true ||
+	die "could not log in to $target"
+[ "$(admin uname -s </dev/null)" = Linux ] || die "$target is not running Linux"
+if ! admin cat /etc/os-release </dev/null | grep -qx 'VERSION_ID="24.04"'; then
+	echo "Note: the monitoring playbook was written for Ubuntu 24.04, which $target is not running."
+fi
+
+# The address this connection comes from is the one the deployer's will.
+if [ -z "$allowed" ]; then
+	# shellcheck disable=SC2016
+	allowed=$(admin 'echo $SSH_CONNECTION' </dev/null | cut -d' ' -f1)
+	[ -n "$allowed" ] || die "could not learn this machine's address from the server. Name it with -a."
+fi
+
+echo "Preparing the server for the monitoring deployer"
+remote=$(admin mktemp -d /tmp/fcc-setup.XXXXXXXXXX </dev/null)
+admin "cat >$remote/install.sh" <monitoring/install.sh
+sudo=sudo
+[ "$(admin id -u </dev/null)" -ne 0 ] || sudo=
+# With a terminal, because sudo may ask for your password.
+ssh -S "$socket" -q -t -- "$target" "$sudo sh $remote/install.sh '$public openbsd-gitops-monitoring' '$allowed'" ||
+	die "the installation on the server failed"
+
+# Read over the connection that ssh has already verified, so there is no
+# fingerprint to compare by hand.
+host_key=$(admin cat /etc/ssh/ssh_host_ed25519_key.pub </dev/null | cut -d' ' -f1,2)
+case "$host_key" in
+ssh-ed25519\ *) ;;
+*) die "could not read the server's SSH host key" ;;
+esac
+pin=$host
+[ "$port" -eq 22 ] || pin="[$host]:$port"
+{
+	[ ! -f "$known_hosts" ] || awk -v pin="$pin" '$1 != pin' "$known_hosts"
+	echo "$pin $host_key"
+} >"$known_hosts.new"
+mv -f "$known_hosts.new" "$known_hosts"
+echo "Pinned the server's host key: $(echo "$pin $host_key" | ssh-keygen -lf -)"
+
+python3 - "$host" "$port" <<'PYTHON'
+import json
+import sys
+
+host, port = sys.argv[1:]
+with open("monitoring.json") as file:
+    shared = json.load(file)
+wanted = {**shared, "host": host, "port": int(port)}
+if wanted != shared:
+    with open("monitoring.json", "w") as file:
+        file.write(json.dumps(wanted, indent=2) + "\n")
+PYTHON
+
+if [ -f "$secrets" ]; then
+	echo "Keeping the secrets that are already in $secrets"
+else
+	(
+		umask 077
+		cat >"$secrets" <<SECRETS
+# Secrets for the monitoring stack. This file stays on this machine: the
+# monitoring deployer reads it and installs what the server needs.
+
+# The password of Grafana's "admin" user when Grafana first starts. After
+# that, change it in Grafana.
+grafana_admin_password: "$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+SECRETS
+	)
+	echo "Wrote $secrets, with a new password for Grafana"
+fi
+
+if grep -q '^MON_SSH_KEY_FILE=' .env; then
+	echo "Keeping the monitoring lines that are already in .env"
+else
+	cat >>.env <<ENV
+
+# The monitoring deployer; written by ./setup-monitoring.
+MON_SSH_KEY_FILE=$key
+MON_KNOWN_HOSTS_FILE=$known_hosts
+MON_SECRETS_FILE=$secrets
+ENV
+	echo "Added the monitoring deployer's lines to .env"
+fi
+
+# The same connection the deployer will make: the monitoring key, the pinned
+# host key, no ssh_config, and root without a password.
+echo "Checking that the monitoring key works"
+ssh -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
+	-o GlobalKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+	-p "$port" -i "$key" -- "fccmon@$host" sudo -n true </dev/null ||
+	die "the server is prepared, but the monitoring key cannot use it from here. The key is accepted from $allowed only (-a changes that); and if the server's sshd_config has AllowUsers or AllowGroups, add fccmon."
+
+echo
+echo "The monitoring server is ready. Before you start its deployer:"
+if ! git diff --quiet HEAD -- monitoring.json 2>/dev/null; then
+	echo "  - monitoring.json now names $host. Commit it and push:"
+	echo "      git commit -m 'Name the monitoring server' monitoring.json && git push"
+fi
+echo "  - The deployer installs Docker and a host firewall on that server, and"
+echo "    replaces /etc/nftables.conf and /etc/docker/daemon.json there."
+echo "Then: docker compose --profile monitoring up -d --build"
+echo "Grafana's first password is in $secrets. Reach Grafana with:"
+echo "      ssh -L 3000:127.0.0.1:3000 $target     and then http://127.0.0.1:3000"

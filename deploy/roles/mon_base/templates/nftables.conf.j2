@@ -1,0 +1,23 @@
+#!/usr/sbin/nft -f
+# The monitoring server's host firewall, written by openbsd-gitops. Changes
+# made here are overwritten.
+#
+# It keeps to a table of its own and never flushes the whole rule set, because
+# that would take Docker's rules with it. For the same reason, do not restart
+# nftables.service: stopping it flushes everything.
+
+table inet fcc_host
+delete table inet fcc_host
+
+table inet fcc_host {
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		ct state established,related accept
+		ct state invalid drop
+		iif "lo" accept
+		meta l4proto { icmp, ipv6-icmp } accept
+		ip6 saddr fe80::/10 udp dport 546 accept
+		tcp dport {{ monitoring.port | default(22) }} accept
+	}
+}

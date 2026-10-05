@@ -8,6 +8,11 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/* \
   && pip install --no-cache-dir ansible-core==2.17.5
 
+# Installed where any user ID the container runs as can read them.
+COPY requirements.yml /tmp/requirements.yml
+RUN ansible-galaxy collection install -r /tmp/requirements.yml -p /usr/share/ansible/collections \
+  && rm -rf /tmp/requirements.yml /root/.ansible
+
 COPY entrypoint.sh /usr/local/bin/fw-deployer
 RUN chmod 755 /usr/local/bin/fw-deployer && mkdir /state && chmod 1777 /state
 

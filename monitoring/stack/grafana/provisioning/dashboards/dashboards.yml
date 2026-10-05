@@ -1,0 +1,13 @@
+# Grafana shows every dashboard in monitoring/stack/grafana/dashboards, and
+# drops one that is removed there. They cannot be changed in Grafana itself:
+# edit the file and commit it.
+apiVersion: 1
+
+providers:
+  - name: openbsd-gitops
+    type: file
+    allowUiUpdates: false
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards

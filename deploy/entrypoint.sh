@@ -7,11 +7,25 @@
 # A commit that succeeded is re-applied on every pass, which is a no-op unless
 # someone changed the rules on the firewall by hand, whether the ones it is
 # running or its /etc/pf.conf, in which case they are put back.
+#
+# The monitoring deployer (the monitoring-deployer service in compose.yaml)
+# runs this same loop with PLAYBOOK pointing at its own playbook and
+# RETRY_POLICY=always: nothing it does can lock anyone out of the firewall, so
+# every failure is retried. Left unset, both keep the behaviour described above.
 set -eu
 
 : "${REPO_URL:?REPO_URL is not set}"
 BRANCH=${BRANCH:-main}
 INTERVAL=${INTERVAL:-60}
+PLAYBOOK=${PLAYBOOK:-deploy/playbook.yml}
+RETRY_POLICY=${RETRY_POLICY:-firewall}
+case "$RETRY_POLICY" in
+firewall | always) ;;
+*)
+	echo "RETRY_POLICY must be 'firewall' or 'always', not '$RETRY_POLICY'" >&2
+	exit 64
+	;;
+esac
 STATE=${STATE_DIR:-/state}
 CHECKOUT=$STATE/checkout
 export FW_WORK_DIR=$STATE
@@ -73,15 +87,21 @@ while :; do
 		else
 			[ "$commit" = "$tried" ] || log "deploying $commit: $(git -C "$CHECKOUT" log -1 --format=%s "origin/$BRANCH")"
 			git -C "$CHECKOUT" reset --quiet --hard "origin/$BRANCH"
-			# The playbook creates the first file just before it loads rules,
-			# and the second if only the DHCP configuration fails.
+			# The firewall's playbook creates the first file just before it
+			# loads rules, and the second if only the DHCP configuration fails.
 			rm -f "$STATE/rules-were-loaded" "$STATE/dhcp-failed"
-			if ansible-playbook -i localhost, "$CHECKOUT/deploy/playbook.yml" >"$STATE/last-deploy.log" 2>&1; then
+			if ansible-playbook -i localhost, "$CHECKOUT/$PLAYBOOK" >"$STATE/last-deploy.log" 2>&1; then
 				if grep -q 'changed=[1-9]' "$STATE/last-deploy.log"; then
 					log "deployed $commit"
 				fi
 				rm -f "$STATE/failed"
 				record "$commit" ok
+			elif [ "$RETRY_POLICY" = always ]; then
+				[ "$commit" = "$tried" ] || {
+					log "could not deploy $commit. Retrying every $INTERVAL seconds."
+					grep -m1 -o -E '"msg": "[^"]+"|"stderr": "[^"{][^"]*"|^ERROR! .*' "$STATE/last-deploy.log" | head -n 2
+				}
+				record "$commit" retrying
 			elif [ -f "$STATE/dhcp-failed" ]; then
 				# The rules are live and saved; only the DHCP configuration is
 				# not. Installing it cannot lock anyone out, so keep trying.

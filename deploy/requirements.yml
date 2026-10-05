@@ -1,0 +1,10 @@
+# Ansible collections built into the deployer image, for the monitoring
+# playbook. Pinned, so an upgrade is a commit and a rebuild. These versions
+# support the ansible-core that deploy/Dockerfile installs.
+collections:
+  - name: community.docker
+    version: 5.4.0
+  - name: ansible.posix
+    version: 2.2.2
+  - name: community.general
+    version: 12.6.5

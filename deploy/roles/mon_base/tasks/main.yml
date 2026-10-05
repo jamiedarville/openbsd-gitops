@@ -1,0 +1,32 @@
+# The server itself: security updates and a host firewall that lets in SSH and
+# nothing else. The stack listens on 127.0.0.1 only; see monitoring/stack.
+
+- name: Install the host firewall and automatic security updates
+  ansible.builtin.apt:
+    name:
+      - nftables
+      - unattended-upgrades
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install the host firewall rules
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: nft -c -f %s
+  register: host_firewall
+
+# On every pass, not only when the file changes, so that rules removed by hand
+# come back.
+- name: Load the host firewall rules
+  ansible.builtin.command: nft -f /etc/nftables.conf
+  changed_when: host_firewall is changed
+
+- name: Load the host firewall rules at boot
+  ansible.builtin.systemd_service:
+    name: nftables
+    enabled: true
