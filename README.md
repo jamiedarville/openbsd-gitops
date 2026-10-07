@@ -29,6 +29,7 @@ Firewall configuration for an OpenBSD firewall, kept as plain text in Git.
 | `monitoring.json`            | Which monitoring server this repository is for. See Monitoring.                |
 | `monitoring/`                | The monitoring stack's files, and the script that prepares its server.         |
 | `setup-monitoring`           | Prepares a monitoring server and this machine in one step.                     |
+| `factory-reset`              | Takes all of this off a firewall or a monitoring server again. See Factory reset. |
 
 On OpenBSD, NAT is part of `pf.conf`, not a separate service. Every `*.conf`
 file in `firewall/` and `nat/` is joined in file-name order into one `pf.conf`,
@@ -230,6 +231,57 @@ doas pfctl -f /etc/pf.conf                 # reload the confirmed rules
 doas /usr/local/sbin/fcc-pfctl status      # is a rollback still pending?
 doas cp /etc/pf.conf.fcc-previous /etc/pf.conf && doas pfctl -f /etc/pf.conf   # go back one deployment
 ```
+
+## Factory reset
+
+To take everything this repository put on a server off it again:
+
+```sh
+./factory-reset firewall admin@firewall.example.net
+./factory-reset monitoring admin@monitor.example.net
+```
+
+Name the server the way you would to `ssh`; `-p` gives a port. It needs the
+same account as `./setup` or `./setup-monitoring`, because the deployment keys
+cannot do any of this. It lists what it is about to do and asks you to type
+`reset`; `-y` answers for you. It stops that server's deployer on this machine
+first, and leaves the keys, `.env` and the repository alone, so running
+`./setup` or `./setup-monitoring` again puts everything back.
+
+On the firewall, `target/reset.sh`:
+
+- removes the `fccdeploy` account with its key, `fcc-pfctl`, `fcc-gate`, the
+  line in `/etc/doas.conf`, and what the helper kept in `/var/db/fcc`;
+- replaces `/etc/pf.conf` with the rules OpenBSD is installed with,
+  `/etc/examples/pf.conf`, and loads them;
+- removes `/etc/dhcpd.conf`, and stops and disables `dhcpd`.
+
+**The rules OpenBSD is installed with pass everything and do no NAT.** Networks
+behind the firewall lose their way out, and the firewall filters nothing, until
+you load rules of your own. Connections that are already open stay open.
+`/etc/dhcpd.conf` is removed even if you wrote it by hand and never deployed
+one from here.
+
+On the monitoring server, `monitoring/reset.sh`:
+
+- removes the `fccmon` account with its key and its `sudo` rule;
+- removes the stack's containers, images and data, and `/opt/monitoring`;
+- removes the host firewall and puts back the `/etc/nftables.conf` Ubuntu
+  installs, leaving the server with no host firewall;
+- removes `/etc/docker/daemon.json` and restarts Docker.
+
+Docker itself stays, unless you add `-d`, which removes it with **every**
+container, image and volume on the server, not only the stack's. The packages
+`nftables`, `unattended-upgrades`, `python3` and `sudo` stay either way.
+
+Both scripts can be copied to the server and run there as root instead, for
+example at the firewall's console: `sh reset.sh`. Both are safe to run again.
+
+Neither has been run on a real server. Each was run in an Ubuntu 24.04
+container: `monitoring/reset.sh` after `install.sh`, with stand-ins for
+`systemctl` and `nft` and without Docker, and `target/reset.sh` with stand-ins
+for `uname`, `pfctl`, `rcctl` and `doas`. `./factory-reset` itself has not been
+run against a server at all.
 
 ## What the helper allows
 

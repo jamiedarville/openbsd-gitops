@@ -1,0 +1,140 @@
+#!/bin/sh
+# Undoes ./setup or ./setup-monitoring on the server, and every deployment
+# since:
+#
+#   ./factory-reset [-p port] [-y] firewall [user@]firewall
+#   ./factory-reset [-p port] [-y] [-d] monitoring [user@]server
+#
+# Name the server the way you would to ssh; a Host from your ssh_config works
+# too. The account must be able to log in over SSH and use doas there, or sudo
+# on the monitoring server: the deployment keys cannot do any of this.
+#
+# firewall runs target/reset.sh on the firewall: the fccdeploy account, the
+# helper and its doas rule go, /etc/pf.conf goes back to the rules OpenBSD is
+# installed with, and /etc/dhcpd.conf goes.
+#
+# monitoring runs monitoring/reset.sh on the monitoring server: the fccmon
+# account, the stack and its data, and the host firewall go. -d removes Docker
+# as well, with every container, image and volume on that server.
+#
+# It says what it is about to do and asks first; -y answers for you. It stops
+# that server's deployer on this machine, and leaves the keys, .env and the
+# repository alone, so ./setup or ./setup-monitoring puts everything back.
+set -eu
+
+die() {
+	echo "factory-reset: $*" >&2
+	exit 1
+}
+
+usage() {
+	echo "usage: ./factory-reset [-p port] [-y] firewall [user@]firewall" >&2
+	echo "       ./factory-reset [-p port] [-y] [-d] monitoring [user@]server" >&2
+	exit 64
+}
+
+port=
+sure=0
+docker_too=
+while getopts p:yd option; do
+	case "$option" in
+	p) port=$OPTARG ;;
+	y) sure=1 ;;
+	d) docker_too=-d ;;
+	*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ "$#" -eq 2 ] || usage
+what=$1
+target=$2
+
+case "$what" in
+firewall)
+	[ -z "$docker_too" ] || usage
+	system=OpenBSD
+	script=target/reset.sh
+	root=doas
+	service=deployer
+	again=./setup
+	;;
+monitoring)
+	system=Linux
+	script=monitoring/reset.sh
+	root=sudo
+	service=monitoring-deployer
+	again=./setup-monitoring
+	;;
+*) usage ;;
+esac
+
+cd "$(dirname "$0")"
+
+echo "This will, on $target:"
+if [ "$what" = firewall ]; then
+	echo "  - remove the fccdeploy account, its key, fcc-pfctl, fcc-gate and the doas rule"
+	echo "  - replace /etc/pf.conf with the rules OpenBSD is installed with, and load them."
+	echo "    They pass everything and do no NAT: networks behind the firewall lose their"
+	echo "    way out, and nothing is filtered any more"
+	echo "  - remove /etc/dhcpd.conf, and stop and disable dhcpd"
+else
+	echo "  - remove the fccmon account, its key and its sudo rule"
+	echo "  - remove the monitoring stack and all its data, with /opt/monitoring"
+	echo "  - remove the host firewall, leaving the server with none"
+	if [ -n "$docker_too" ]; then
+		echo "  - remove Docker, with EVERY container, image and volume on the server"
+	else
+		echo "  - remove /etc/docker/daemon.json and restart Docker (-d removes Docker too)"
+	fi
+fi
+if [ "$sure" -eq 0 ]; then
+	printf 'Type the word reset to go on: '
+	read -r answer || answer=
+	[ "$answer" = reset ] || die "nothing was changed"
+fi
+
+# A deployer left running would be cut off halfway, and then fail on every pass.
+if [ -f .env ] && command -v docker >/dev/null 2>&1; then
+	echo "Stopping the $service container on this machine"
+	docker compose --profile monitoring stop "$service" ||
+		echo "Note: could not stop it. If it is running, stop it by hand." >&2
+fi
+
+tmp=$(mktemp -d)
+socket=$tmp/ssh
+remote=
+
+# Runs a command on the server as the administrator, over the connection
+# opened below. Never with a terminal, whatever ssh_config says, so what comes
+# back is exactly what the command printed.
+admin() {
+	ssh -S "$socket" -T -- "$target" "$@"
+}
+
+cleanup() {
+	[ -z "$remote" ] || admin "rm -rf $remote" </dev/null 2>/dev/null || true
+	ssh -S "$socket" -O exit -- "$target" 2>/dev/null || true
+	rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+# One connection, kept open for the steps below, so ssh asks for a password or
+# passphrase only once.
+echo "Connecting to $target"
+# shellcheck disable=SC2086
+ssh -T -o ControlMaster=yes -o ControlPath="$socket" -o ControlPersist=300 ${port:+-p "$port"} -- "$target" true ||
+	die "could not log in to $target"
+[ "$(admin uname -s </dev/null)" = "$system" ] || die "$target is not running $system"
+
+remote=$(admin mktemp -d /tmp/fcc-reset.XXXXXXXXXX </dev/null)
+admin "cat >$remote/reset.sh" <"$script"
+[ "$(admin id -u </dev/null)" -ne 0 ] || root=
+# With a terminal, because doas or sudo may ask for your password.
+ssh -S "$socket" -q -t -- "$target" "$root sh $remote/reset.sh $docker_too" ||
+	die "the reset on $target failed partway. It is safe to run again."
+
+echo
+echo "$target is reset. On this machine, the $service container is stopped, and the"
+echo "keys, .env and the repository are as they were."
+echo "To set the server up again: $again $target"
