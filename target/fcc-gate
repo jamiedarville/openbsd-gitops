@@ -31,6 +31,7 @@ shift 2
 
 case "$#:${1:-}" in
 1:status | 1:validate | 1:backup | 1:apply | 1:commit | 1:rollback | 1:dhcpd-apply) ;;
+1:net-validate | 1:net-apply | 1:dhcpd-remove) ;;
 2:arm)
 	case "$2" in
 	'' | *[!0-9]*) refuse ;;

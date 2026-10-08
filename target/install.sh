@@ -6,10 +6,12 @@
 #   sh install.sh 'ssh-ed25519 AAAA... comment'
 #
 # Safe to run again, for example to install a newer fcc-pfctl; the argument can
-# be left out then. It does not change any PF rules.
+# be left out then. It does not change any PF rules or network settings.
 set -eu
 
 RULE='permit nopass fccdeploy as root cmd /usr/local/sbin/fcc-pfctl'
+# Run at every start: undoes a network change that was never confirmed.
+BOOT='[ ! -x /usr/local/sbin/fcc-pfctl ] || /usr/local/sbin/fcc-pfctl boot'
 GATE=/usr/local/sbin/fcc-gate
 KEYS=/home/fccdeploy/.ssh/authorized_keys
 # "restrict" stops the key being used for forwarding or a terminal, and
@@ -46,6 +48,7 @@ fi
 
 grep -qxF "$RULE" /etc/doas.conf 2>/dev/null || echo "$RULE" >>/etc/doas.conf
 doas -C /etc/doas.conf
+grep -qxF "$BOOT" /etc/rc.local 2>/dev/null || echo "$BOOT" >>/etc/rc.local
 
 echo "Installed fcc-pfctl $(sha256 -q /usr/local/sbin/fcc-pfctl)"
 pfctl -si | head -1

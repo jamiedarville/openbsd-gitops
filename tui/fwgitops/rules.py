@@ -15,14 +15,27 @@ from pathlib import Path
 
 # The folders whose *.conf files are joined, in file-name order, into pf.conf.
 PF_FOLDERS = ("firewall", "nat")
+SETTINGS_FILE = Path("firewall/10-settings.conf")
 RULES_FILE = Path("firewall/30-rules.conf")
 NAT_FILE = Path("nat/20-nat.conf")
 DHCP_FILE = Path("dhcp/dhcpd.conf")
+# The folder whose files are installed in /etc on the firewall, under the same
+# names: hostname.<interface>, sysctl.conf and mygate.
+NETWORK_FOLDER = Path("network")
+SYSCTL_FILE = NETWORK_FOLDER / "sysctl.conf"
+# The first line of the network configuration as it is sent; the firewall's
+# helper expects exactly this.
+NETWORK_HEADER = "# openbsd-gitops network"
+_NETWORK_FILE = re.compile(r"^(hostname\.[a-z]+[0-9]+|sysctl\.conf|mygate)$")
 
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,30}$")
 _INTERFACE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,14}$")
 _PORT = re.compile(r"^\d{1,5}(:\d{1,5})?$")
 _MAC = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+_MACRO = re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]{0,30}$")
+# An interface's own addresses: vlan10:network, or (vlan10:network) to have PF
+# look them up as it goes instead of once when the rules are loaded.
+_INTERFACE_ADDRESS = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,14}(:network|:broadcast|:peer|:0)?$")
 _HOSTNAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
@@ -35,24 +48,29 @@ class InvalidInput(ValueError):
 
 def check_interface(value: str) -> str:
     value = value.strip()
-    if value and not _INTERFACE.match(value):
-        raise InvalidInput("An interface looks like em0, vio0 or egress")
+    if value and not _INTERFACE.match(value) and not _MACRO.match(value):
+        raise InvalidInput("An interface looks like em0, vlan10 or egress, or is a macro like $lan")
     return value
 
 
 def check_address(value: str) -> str:
-    """Accepts any, an IP address, a network, a <table>, or an interface in
-    brackets such as (egress)."""
+    """Accepts any, an IP address, a network, a <table>, a $macro, or an
+    interface's addresses such as (egress) or (vlan10:network)."""
     value = value.strip()
     if value in ("", "any"):
         return "any"
+    if _MACRO.match(value):
+        return value
+    if ":" in value and _INTERFACE_ADDRESS.match(value.strip("()")) and value.count("(") == value.count(")") <= 1:
+        if value.startswith("(") == value.endswith(")"):
+            return value
     if value.startswith("<") and value.endswith(">"):
         if not _NAME.match(value[1:-1]):
             raise InvalidInput("A table is written like <admins>")
         return value
     if value.startswith("(") and value.endswith(")"):
-        if not _INTERFACE.match(value[1:-1]):
-            raise InvalidInput("An interface address is written like (egress)")
+        if not _INTERFACE_ADDRESS.match(value[1:-1]):
+            raise InvalidInput("An interface address is written like (egress) or (vlan10:network)")
         return value
     try:
         if "/" in value:
@@ -61,7 +79,7 @@ def check_address(value: str) -> str:
     except ValueError:
         raise InvalidInput(
             "Enter any, an address like 192.0.2.10, a network like 10.0.0.0/8, "
-            "a table like <admins>, or (interface)"
+            "a table like <admins>, a macro like $lan, or an interface's own like (vlan10:network)"
         ) from None
 
 
@@ -155,7 +173,7 @@ def outbound_nat(interface: str, source: str, comment: str = "") -> str:
         raise InvalidInput("Outbound NAT needs the outside interface, such as egress")
     source = check_address(source)
     if source == "any":
-        raise InvalidInput("Give the inside network to translate, such as 192.168.10.0/24")
+        raise InvalidInput("Give the inside network to translate, such as 192.168.10.0/24 or (vlan10:network)")
     return _with_comment(
         f"match out on {interface} inet from {source} to any nat-to ({interface})", comment
     )
@@ -218,6 +236,105 @@ def dhcp_static_lease(name: str, mac: str, address: str) -> str:
         f"host {name} {{ hardware ethernet {mac.strip().lower()}; "
         f"fixed-address {_ip4(address, 'The address')}; }}"
     )
+
+
+def macro(name: str, value: str) -> str:
+    """A name for something written often, used in rules as $name."""
+    name, value = name.strip().lstrip("$"), " ".join(value.split())
+    if not _NAME.match(name):
+        raise InvalidInput("A macro's name uses letters, digits and underscores, like lan")
+    if not value or '"' in value or "\\" in value or "#" in value:
+        raise InvalidInput("Give what the macro stands for, such as vlan10, without quotes")
+    return f'{name} = "{value}"'
+
+
+def table(name: str, addresses: str) -> str:
+    """A named list of addresses, used in rules as <name>."""
+    name = name.strip().strip("<>")
+    if not _NAME.match(name):
+        raise InvalidInput("A table's name uses letters, digits and underscores, like admins")
+    members = []
+    for member in re.split(r"[\s,]+", addresses.strip()):
+        if not member:
+            continue
+        try:
+            members.append(str(ipaddress.ip_network(member, strict=False)) if "/" in member else str(ipaddress.ip_address(member)))
+        except ValueError:
+            raise InvalidInput("A table holds addresses and networks, like 192.0.2.10 10.0.0.0/8") from None
+    if not members:
+        raise InvalidInput("Give at least one address")
+    return f"table <{name}> {{ {', '.join(members)} }}"
+
+
+# ---------------------------------------------------------------- the network
+
+
+def check_port(value: str) -> str:
+    """A physical port, as the parent of a VLAN."""
+    value = value.strip()
+    if not re.match(r"^[a-z]+[0-9]+$", value) or value.startswith(("vlan", "lo", "enc", "pflog")):
+        raise InvalidInput("A port is named like em1 or igc0; see ifconfig on the firewall")
+    return value
+
+
+def check_vlan_number(value: str) -> int:
+    if not value.strip().isdigit() or not 1 <= int(value) <= 4094:
+        raise InvalidInput("A VLAN number is 1 to 4094")
+    return int(value)
+
+
+def check_interface_address(value: str) -> ipaddress.IPv4Interface:
+    """The firewall's own address on a network, with the network's size."""
+    try:
+        address = ipaddress.IPv4Interface(value.strip())
+    except ValueError:
+        address = None
+    if address is None or "/" not in value or address.network.prefixlen > 30:
+        raise InvalidInput("Give the address with its network size, like 192.168.10.1/24")
+    if address.ip in (address.network.network_address, address.network.broadcast_address):
+        raise InvalidInput(f"{address.ip} is not a usable address in {address.network}")
+    return address
+
+
+def vlan_interface(port: str, number: int, address: ipaddress.IPv4Interface, comment: str = "") -> tuple[Path, list[str]]:
+    """The interface file for a VLAN: where it goes, and its lines."""
+    comment = check_comment(comment)
+    lines = [f"# {comment}"] if comment else []
+    lines += [
+        f"parent {check_port(port)} vnetid {number}",
+        f"inet {address.ip} {address.network.netmask}",
+        "up",
+    ]
+    return NETWORK_FOLDER / f"hostname.vlan{number}", lines
+
+
+def dhcp_range(address: ipaddress.IPv4Interface) -> tuple[str, str]:
+    """A sensible stretch of a network to hand out: .100 to .200 where there
+    is room, the upper half otherwise, and never the firewall's own address."""
+    network = address.network
+    if network.num_addresses >= 256:
+        first, last = network.network_address + 100, network.network_address + 200
+    else:
+        first, last = network.network_address + network.num_addresses // 2, network.broadcast_address - 1
+    if first <= address.ip <= last:
+        if address.ip == last:
+            last -= 1
+        else:
+            first = address.ip + 1
+    return str(first), str(last)
+
+
+FORWARDING = "net.inet.ip.forwarding=1"
+
+
+def routing_is_on(root: Path) -> bool:
+    return FORWARDING in (line.strip() for line in read_lines(root / SYSCTL_FILE))
+
+
+def with_routing(lines: list[str], on: bool) -> list[str]:
+    """The lines of sysctl.conf with packet forwarding switched on or off."""
+    kept = [line for line in lines if not line.strip().startswith("net.inet.ip.forwarding=")]
+    return [*kept, FORWARDING] if on else kept
 
 
 # ------------------------------------------------------------------ the files
@@ -286,6 +403,35 @@ def assemble_pf(root: Path) -> str:
         text = path.read_text()
         parts.append(f"# --- {path.relative_to(root)} ---\n{text if text.endswith(chr(10)) else text + chr(10)}")
     return "\n".join(parts)
+
+
+def network_files(root: Path) -> list[Path]:
+    """The files that make up the network configuration, in the order sent.
+
+    A hostname file always counts, since even an empty one creates its
+    interface. sysctl.conf and mygate count once they hold more than comments.
+    """
+    folder = root / NETWORK_FOLDER
+    if not folder.is_dir():
+        return []
+    files = [
+        path
+        for path in folder.iterdir()
+        if path.is_file()
+        and _NETWORK_FILE.match(path.name)
+        and (path.name.startswith("hostname.") or any(is_rule(line) for line in read_lines(path)))
+    ]
+    # In byte order, which is how the firewall sorts them when it reports back.
+    return sorted(files, key=lambda path: path.name.encode())
+
+
+def assemble_network(root: Path) -> str:
+    """Joins the network files exactly as the deployment sends them."""
+    parts = [NETWORK_HEADER + "\n"]
+    for path in network_files(root):
+        text = path.read_text()
+        parts.append(f"# --- {path.name} ---\n{text if text.endswith(chr(10)) else text + chr(10)}")
+    return "".join(parts)
 
 
 def digest(text: str) -> str:

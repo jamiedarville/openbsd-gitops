@@ -1,6 +1,7 @@
 # openbsd-gitops
 
-Firewall configuration for an OpenBSD firewall, kept as plain text in Git.
+Configuration for an OpenBSD firewall and router, kept as plain text in Git:
+its PF rules, NAT, interfaces and VLANs, routing, and DHCP.
 
 - **The files in this repository are the configuration.** Read them, edit them
   by hand, or use the `./fw` editor to build rules for you.
@@ -19,6 +20,7 @@ Firewall configuration for an OpenBSD firewall, kept as plain text in Git.
 | `firewall/10-settings.conf`  | PF options, macros, and tables. Loaded first.                                  |
 | `nat/20-nat.conf`            | NAT and port forwards.                                                         |
 | `firewall/30-rules.conf`     | Filter rules.                                                                  |
+| `network/`                   | Interfaces, VLANs, routing and the default route. See Networks.                |
 | `dhcp/dhcpd.conf`            | DHCP server configuration. Ignored while it holds only comments.               |
 | `firewall.json`              | Which firewall this repository is for.                                         |
 | `deploy/`                    | The Ansible playbook and the container that runs it.                           |
@@ -30,6 +32,7 @@ Firewall configuration for an OpenBSD firewall, kept as plain text in Git.
 | `monitoring/`                | The monitoring stack's files, and the script that prepares its server.         |
 | `setup-monitoring`           | Prepares a monitoring server and this machine in one step.                     |
 | `factory-reset`              | Takes all of this off a firewall or a monitoring server again. See Factory reset. |
+| `test/`                      | OpenBSD test machines and the test that deploys to them. See Tests.            |
 
 On OpenBSD, NAT is part of `pf.conf`, not a separate service. Every `*.conf`
 file in `firewall/` and `nat/` is joined in file-name order into one `pf.conf`,
@@ -44,11 +47,13 @@ example `firewall/40-guests.conf`. `./fw assemble` prints the joined result.
 
 | Menu entry                 | What it does                                                             |
 | -------------------------- | ------------------------------------------------------------------------ |
+| Networks: VLANs and routing | Add a VLAN with a guided form, switch routing on or off, edit an interface. |
 | Firewall rules             | Create a rule with a guided form, or list, edit, reorder, and delete them. |
 | NAT and port forwards      | The same, with a guide for outbound NAT and port forwards.                |
 | DHCP                       | The same, with a guide for networks and fixed addresses.                  |
+| Settings: macros and tables | The same, with a guide for macros and tables.                            |
 | Review changes             | Shows what you changed since the last commit.                             |
-| Check rules on the firewall | Has the firewall's own `pfctl` parse the rules. Changes nothing.         |
+| Check on the firewall      | Has the firewall check the rules and the network files. Changes nothing.  |
 | Save and deploy            | Commits your changes, and pushes them if you agree.                       |
 | Status                     | Compares this folder with what the firewall is running.                   |
 
@@ -62,12 +67,65 @@ cannot express, write by hand; it will leave your lines alone.
 Without the menus:
 
 ```sh
-./fw assemble   # print pf.conf exactly as it will be deployed
-./fw check      # have the firewall parse the rules; changes nothing
-./fw status     # compare this folder with the firewall
+./fw assemble           # print pf.conf exactly as it will be deployed
+./fw assemble-network   # print the network files exactly as they will be sent
+./fw check              # have the firewall check both; changes nothing
+./fw status             # compare this folder with the firewall
 ```
 
 Undo a change with `git revert <commit>` and push.
+
+## Networks
+
+The files in `network/` are installed in `/etc` on the firewall under the same
+names, and are the files OpenBSD itself uses:
+
+| File                      | What it holds                                                    |
+| ------------------------- | ---------------------------------------------------------------- |
+| `network/hostname.em1`    | One interface, as in `hostname.if(5)`. One file per interface.   |
+| `network/hostname.vlan10` | A VLAN. The firewall creates it, and removes it with its file.   |
+| `network/sysctl.conf`     | Routing on or off. Ignored while it holds only comments.         |
+| `network/mygate`          | A fixed default route, as one IPv4 address. Leave it out when the outside port gets its address by DHCP. |
+
+A VLAN with number 10 on the port `em1` is two files:
+
+```
+# network/hostname.em1
+up
+
+# network/hostname.vlan10
+parent em1 vnetid 10
+inet 192.168.10.1 255.255.255.0
+up
+```
+
+**Add a VLAN** in `./fw` writes these for you. If you ask it to, it also adds
+the DHCP network, the outbound NAT rule, the rule that lets the network out,
+and switches routing on. A new network can reach nothing, and nothing can
+reach it, until a rule in `firewall/30-rules.conf` says so.
+
+In rules, write a network's addresses as `(vlan10:network)`, in brackets. PF
+then looks them up as it goes, so the rule can be checked before the VLAN
+exists and follows it when it is renumbered.
+
+What the firewall accepts is deliberately narrow, because OpenBSD runs every
+line of an interface file through the shell:
+
+- outside comments, an interface file may hold only letters, digits, spaces
+  and `. _ : / -`. A line starting with `!`, which OpenBSD would run as a
+  command, is refused;
+- the interface must be a VLAN or a port the firewall already has. `lo`, `enc`,
+  `pflog` and `pfsync` are refused;
+- `sysctl.conf` may set only `net.inet.ip.forwarding` and
+  `net.inet6.ip6.forwarding`. A `/etc/sysctl.conf` written by hand that holds
+  anything else is not taken over; the deployment stops and says so;
+- only the files it installed are ever removed. An interface file that was on
+  the firewall before, such as the outside port's, stays until this folder
+  holds one of the same name.
+
+Not handled yet: IPv6 addresses in `mygate`, interfaces other than ports and
+VLANs, and addresses added to a port as aliases, which stay until a restart
+when the file stops naming them.
 
 ## How a deployment works
 
@@ -75,25 +133,39 @@ For each new commit on the branch, the deployer:
 
 1. joins the files into `pf.conf` and asks the firewall to parse it;
 2. arms a watchdog on the firewall;
-3. loads the rules into the running firewall only;
-4. reconnects over SSH to prove the new rules still let it in;
-5. saves the rules as `/etc/pf.conf` and disarms the watchdog.
+3. if the network files changed, installs them and brings the network up;
+4. loads the rules into the running firewall only;
+5. reconnects over SSH to prove the firewall still lets it in;
+6. saves the rules as `/etc/pf.conf`, keeps the network files, and disarms the
+   watchdog.
 
-If step 4 fails, or the deployer disappears, the watchdog reloads the previous
-`/etc/pf.conf` when the grace period (`graceSeconds` in `firewall.json`) ends.
-A reboot does the same.
+If step 5 fails, or the deployer disappears, the watchdog reloads the previous
+`/etc/pf.conf` and puts the previous network files back when the grace period
+(`graceSeconds` in `firewall.json`) ends. A reboot does the same: the rules
+were never saved, and a line in `/etc/rc.local` undoes a network change that
+was never confirmed. After such a restart the firewall comes up on the new
+addresses for a moment before it switches back.
 
-A commit whose rules were loaded and then failed is **not retried**, so a bad
-change cannot lock the firewall out repeatedly. Push a fix or a revert. A
+When the network files change, the rules are checked after the network is up
+and not before, since they may name an interface that is only then there.
+
+A commit whose rules or network files were tried and then failed is **not
+retried**, so a bad change cannot lock the firewall out repeatedly. Push a fix or a revert. A
 commit that never got as far as loading rules, because the firewall was
 unreachable or its `pfctl` rejected them, is retried on every pass, since
 nothing was changed. A commit that succeeded is re-applied on every pass, which
 puts back rules changed on the firewall by hand, whether in the running
-firewall or in `/etc/pf.conf`. The firewall is asked what it is running; the
-contents of tables and anchors are not compared.
+firewall or in `/etc/pf.conf`, and network files changed in `/etc`. The
+firewall is asked what it is running; the contents of tables and anchors are
+not compared, and neither are addresses set by hand with `ifconfig`.
 
-If the rules deploy but the DHCP configuration cannot be installed, the rules
-stay in place and the DHCP configuration is tried again on every pass.
+A DHCP configuration in `dhcp/dhcpd.conf` switches `dhcpd` on and starts it;
+it is started afresh whenever the network files change, because it only listens
+on the interfaces it found when it started. Emptying the file again stops
+`dhcpd`, switches it off and removes `/etc/dhcpd.conf`, but only if that file
+came from here. If the rules deploy but the DHCP configuration cannot be
+installed, the rules stay in place and the DHCP configuration is tried again
+on every pass.
 
 ## Setting it up
 
@@ -137,7 +209,8 @@ compare it with the one shown on the firewall's console by
 
 `install.sh` creates the `fccdeploy` account, installs the helper as
 `/usr/local/sbin/fcc-pfctl`, and adds one line to `/etc/doas.conf` that lets
-that account run that one command as root. It installs
+that account run that one command as root, and one to `/etc/rc.local` that
+runs the helper at every start. It installs
 `/usr/local/sbin/fcc-gate` and ties the key to it, so the key can do nothing
 but call the helper.
 
@@ -251,10 +324,14 @@ first, and leaves the keys, `.env` and the repository alone, so running
 On the firewall, `target/reset.sh`:
 
 - removes the `fccdeploy` account with its key, `fcc-pfctl`, `fcc-gate`, the
-  line in `/etc/doas.conf`, and what the helper kept in `/var/db/fcc`;
+  lines in `/etc/doas.conf` and `/etc/rc.local`, and what the helper kept in
+  `/var/db/fcc`;
 - replaces `/etc/pf.conf` with the rules OpenBSD is installed with,
   `/etc/examples/pf.conf`, and loads them;
-- removes `/etc/dhcpd.conf`, and stops and disables `dhcpd`.
+- removes `/etc/dhcpd.conf`, and stops and disables `dhcpd`;
+- leaves the network as it is. The interface files, `/etc/sysctl.conf` and
+  `/etc/mygate` stay, because taking them away could leave the machine with no
+  address to reach it on.
 
 **The rules OpenBSD is installed with pass everything and do no NAT.** Networks
 behind the firewall lose their way out, and the firewall filters nothing, until
@@ -277,18 +354,21 @@ container, image and volume on the server, not only the stack's. The packages
 Both scripts can be copied to the server and run there as root instead, for
 example at the firewall's console: `sh reset.sh`. Both are safe to run again.
 
-Neither has been run on a real server. Each was run in an Ubuntu 24.04
-container: `monitoring/reset.sh` after `install.sh`, with stand-ins for
-`systemctl` and `nft` and without Docker, and `target/reset.sh` with stand-ins
-for `uname`, `pfctl`, `rcctl` and `doas`. `./factory-reset` itself has not been
-run against a server at all.
+`./factory-reset firewall` and `target/reset.sh` are run against OpenBSD 7.9
+by `test/run`. `monitoring/reset.sh` has not been run on a real server: it was
+run in an Ubuntu 24.04 container after `install.sh`, with stand-ins for
+`systemctl` and `nft` and without Docker, and `./factory-reset monitoring` has
+not been run against a server at all.
 
 ## What the helper allows
 
 The deployment account can run exactly one command as root, `fcc-pfctl`, with
 these operations: `status`, `validate`, `backup`, `arm <seconds>`, `apply`,
-`commit`, `rollback`, and `dhcpd-apply`. Every path in it is fixed, and rules
-are refused unless the watchdog is armed.
+`commit`, `rollback`, `net-validate`, `net-apply`, `dhcpd-apply`, and
+`dhcpd-remove`. Rules and network files are refused unless the watchdog is
+armed. Every path in it is fixed, except that network files are installed as
+`/etc/hostname.<interface>`, `/etc/sysctl.conf` and `/etc/mygate`, within the
+limits listed under Networks.
 
 The deployment key is tied to `fcc-gate`, which runs
 `doas /usr/local/sbin/fcc-pfctl` with one of those operations and refuses
@@ -299,13 +379,11 @@ The deployer runs the playbook from the repository it clones, so whoever can
 push to the branch decides what the deployer does with the deployment key.
 Protect the branch accordingly.
 
-The PF operations were proven on OpenBSD 7.9, including recovery from a
-deliberate lockout. `dhcpd-apply` has not been run on OpenBSD yet. Neither have
-`fcc-gate`, the check of the running rules in `status`, or the watchdog taking
-over a stuck lock: those were only run against stand-ins for `pfctl` and
-`doas` on Linux. `./setup` has not been run against OpenBSD either: it was
-run against a Linux container with OpenSSH's `sshd` and the portable `doas`,
-and stand-ins for `pfctl`, `sha256`, `uname` and `useradd`.
+All of this is run against OpenBSD 7.9 by `test/run`: `./setup`, `fcc-gate`,
+the rules, the network files, DHCP, recovery from a deliberate lockout, and
+recovery from losing power between trying a change and keeping it. One thing
+is not: the watchdog taking over a stuck lock, which was only run against
+stand-ins for `pfctl` and `doas` on Linux.
 
 ## Monitoring
 
@@ -419,3 +497,25 @@ cd tui && PYTHONPATH=. python3 -m unittest discover -s tests
 
 They cover the rule builders and drive the editor through a real terminal.
 They need only Python 3.
+
+The deployment itself is tested against real OpenBSD, in two virtual machines
+on this computer: a firewall, and a client on a trunk behind it.
+
+```sh
+test/vm build   # once: installs OpenBSD 7.9 under QEMU and keeps a clean copy
+test/run        # about five minutes
+```
+
+`test/run` puts both machines back to the clean install, sets the firewall up
+with `./setup`, and deploys to it the way the deployer does. It then checks
+that a client gets an address by DHCP on two VLANs, reaches the internet
+through NAT, and cannot cross from one VLAN to the other; that the helper
+turns down network files that could run commands; and that the firewall
+recovers from a VLAN that cannot come up, from its management port being taken
+down, and from losing power halfway through a change.
+
+It needs QEMU with KVM, `socat` and `ansible-playbook`, and no root. Nothing
+listens beyond `127.0.0.1`. `test/vm` alone lists its commands, among them
+`test/vm ssh firewall` and `test/vm console firewall`. The machines, their
+keys and their passwords are kept in `~/fcc-vm`. The installer's image is
+checked against the SHA256 published beside it, not against its signature.

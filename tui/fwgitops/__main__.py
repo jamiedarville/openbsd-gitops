@@ -2,7 +2,9 @@
 
     fw            open the editor
     fw assemble   print pf.conf exactly as it will be deployed
-    fw check      ask the firewall to parse the rules; changes nothing
+    fw assemble-network   print the network files exactly as they will be sent
+    fw check      ask the firewall to check the rules and the network files;
+                  changes nothing
     fw status     compare this folder with what the firewall is running
 """
 
@@ -33,17 +35,30 @@ def main(arguments: list[str]) -> int:
     if command == "assemble":
         sys.stdout.write(rules.assemble_pf(root))
         return 0
+    if command == "assemble-network":
+        sys.stdout.write(rules.assemble_network(root))
+        return 0
     if command == "check":
-        pf_conf = rules.assemble_pf(root)
-        try:
-            answer = remote.run_helper(remote.load_firewall(root), "validate", stdin=pf_conf)
-        except remote.RemoteError as problem:
-            print(f"Rejected: {problem}", file=sys.stderr)
-            return 1
-        if answer.get("candidate_sha256") != rules.digest(pf_conf):
-            print("The firewall received something different from what was sent.", file=sys.stderr)
-            return 1
-        print("The firewall accepts these rules. Nothing was changed.")
+        firewall = remote.load_firewall(root)
+        checks = [("validate", rules.assemble_pf(root))]
+        if rules.network_files(root):
+            checks.append(("net-validate", rules.assemble_network(root)))
+        for operation, text in checks:
+            try:
+                answer = remote.run_helper(firewall, operation, stdin=text)
+            except remote.RemoteError as problem:
+                print(f"Rejected: {problem}", file=sys.stderr)
+                if "no IP address found" in str(problem) and len(checks) > 1:
+                    print(
+                        "A rule uses the address of an interface the firewall does not have yet. "
+                        "Write it in brackets, like (vlan10:network), and PF looks it up as it goes.",
+                        file=sys.stderr,
+                    )
+                return 1
+            if answer.get("candidate_sha256") != rules.digest(text):
+                print("The firewall received something different from what was sent.", file=sys.stderr)
+                return 1
+        print("The firewall accepts this configuration. Nothing was changed.")
         return 0
     if command == "status":
         try:
@@ -57,7 +72,11 @@ def main(arguments: list[str]) -> int:
         print(f"firewall saved:   {saved}")
         print(f"firewall running: {live}")
         print(f"last rollback:    {answer.get('last_rollback')}")
-        in_sync = live == saved == wanted
+        # A helper from before network support says nothing about it.
+        network = answer.get("net_sha256", rules.digest(rules.NETWORK_HEADER + "\n"))
+        wanted_network = rules.digest(rules.assemble_network(root))
+        print(f"network files:    {'the same' if network == wanted_network else 'different'}")
+        in_sync = live == saved == wanted and network == wanted_network
         print("in sync" if in_sync else "different")
         return 0 if in_sync else 2
 

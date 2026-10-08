@@ -1,0 +1,217 @@
+#!/bin/sh
+# Proves the deployment against real OpenBSD: the machines of test/vm.
+#
+#   test/run
+#
+# It puts both machines back to a clean install, sets the firewall up with
+# ./setup from a copy of this folder, and deploys to it the way the deployer
+# does. It then breaks things on purpose, including locking itself out and
+# cutting the power halfway, and checks that the firewall recovers. About five
+# minutes. Build the machines first: test/vm build
+set -u
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+vm=$here/test/vm
+vm_home=${FCC_VM_DIR:-$HOME/fcc-vm}
+tmp=$(mktemp -d)
+work=$tmp/work
+trap 'rm -rf "$tmp"' EXIT
+
+failures=0
+check() {
+	# check "what is expected" command...
+	what=$1
+	shift
+	if "$@" >"$tmp/out" 2>&1; then
+		echo "ok    $what"
+	else
+		echo "FAIL  $what"
+		sed 's/^/        /' "$tmp/out" | tail -15
+		failures=$((failures + 1))
+	fi
+}
+step() {
+	echo
+	echo "== $*"
+}
+
+# One operation of the helper, as the deployment key.
+helper() {
+	FW_HOST=127.0.0.1 FW_PORT=2222 FW_USER=fccdeploy FW_SSH_KEY=$tmp/keys/id_ed25519 \
+		FW_KNOWN_HOSTS=$tmp/keys/known_hosts "$work/deploy/fw-helper" "$@"
+}
+# One pass of the deployer.
+deploy() {
+	rm -f "$tmp/state/rules-were-loaded" "$tmp/state/dhcp-failed"
+	(cd "$work" && FW_SSH_KEY=$tmp/keys/id_ed25519 FW_KNOWN_HOSTS=$tmp/keys/known_hosts \
+		FW_WORK_DIR=$tmp/state ANSIBLE_NOCOLOR=1 ANSIBLE_LOCAL_TEMP=$tmp/state/ansible \
+		ansible-playbook -i localhost, deploy/playbook.yml >"$tmp/state/deploy.log" 2>&1)
+}
+deploy_fails() {
+	! deploy
+}
+in_sync() {
+	(cd "$work" && ./fw status)
+}
+firewall() {
+	"$vm" ssh firewall "$@"
+}
+client() {
+	"$vm" ssh client "$@"
+}
+said() {
+	# said "text" command...: the command's output holds the text.
+	text=$1
+	shift
+	"$@" 2>&1 | grep -qF -- "$text"
+}
+fails() {
+	! "$@"
+}
+nothing_to_do() {
+	deploy && grep -q 'changed=0' "$tmp/state/deploy.log"
+}
+# What the firewall is running and has saved, to compare before and after.
+fingerprint() {
+	helper status | grep -E '^(net|loaded|committed)_sha256'
+}
+unchanged() {
+	[ "$(fingerprint)" = "$good" ]
+}
+other_command() {
+	ssh -F /dev/null -i "$tmp/keys/id_ed25519" -o UserKnownHostsFile="$tmp/keys/known_hosts" \
+		-o IdentitiesOnly=yes -o BatchMode=yes -p 2222 fccdeploy@127.0.0.1 id
+}
+try_network() {
+	./fw assemble-network | helper net-apply
+}
+refused() {
+	# A network configuration the helper must turn down.
+	! printf '# openbsd-gitops network\n%b' "$1" | helper net-validate
+}
+
+step "Clean machines"
+"$vm" reset firewall >/dev/null && "$vm" reset client >/dev/null
+check "the firewall starts" "$vm" start firewall
+check "the client starts" "$vm" start client
+
+mkdir -p "$tmp/bin" "$tmp/state" "$work"
+(cd "$here" && git ls-files -co --exclude-standard -z | xargs -0 tar cf - | tar xf - -C "$work")
+# ./setup and ./factory-reset log in the way a person would; this stands in
+# for an entry in ~/.ssh/config.
+printf '#!/bin/sh\nexec /usr/bin/ssh -F %s "$@"\n' "$vm_home/ssh_config" >"$tmp/bin/ssh"
+chmod +x "$tmp/bin/ssh"
+
+step "Setup"
+check "./setup prepares the firewall" env PATH="$tmp/bin:$PATH" FW_KEY_DIR="$tmp/keys" "$work/setup" fcc-firewall
+check "the deployment key reaches the helper" helper status
+check "the key cannot run anything else" fails other_command
+check "the key cannot run the boot operation" fails helper boot
+
+step "Rules only"
+check "the first deployment succeeds" deploy
+check "the firewall runs what this folder holds" in_sync
+
+step "What the helper turns down"
+check "a command in an interface file" refused '# --- hostname.vlan30 ---\n!touch /tmp/owned\n'
+check "shell syntax in an interface file" refused '# --- hostname.vlan30 ---\nup; touch /tmp/owned\n'
+check "the loopback interface" refused '# --- hostname.lo0 ---\nup\n'
+check "an interface the firewall does not have" refused '# --- hostname.em7 ---\nup\n'
+check "a kernel setting outside the list" refused '# --- sysctl.conf ---\nkern.securelevel=-1\n'
+check "a command in mygate" refused '# --- mygate ---\n!reboot\n'
+check "a file outside /etc" refused '# --- ../tmp/x ---\nup\n'
+check "network files without an armed watchdog" fails try_network
+
+step "Two VLANs, routing, NAT and DHCP"
+cd "$work" || exit 1
+printf 'up\n' >network/hostname.vio1
+printf 'parent vio1 vnetid 10\ninet 192.168.10.1 255.255.255.0\nup\n' >network/hostname.vlan10
+printf 'parent vio1 vnetid 20\ninet 192.168.20.1 255.255.255.0\nup\n' >network/hostname.vlan20
+echo 'net.inet.ip.forwarding=1' >>network/sysctl.conf
+cat >>nat/20-nat.conf <<'RULES'
+match out on egress inet from (vlan10:network) to any nat-to (egress)
+match out on egress inet from (vlan20:network) to any nat-to (egress)
+RULES
+cat >>firewall/30-rules.conf <<'RULES'
+pass in on vlan10 from (vlan10:network) to any
+pass in on vlan20 from (vlan20:network) to ! (vlan10:network)
+RULES
+cat >>dhcp/dhcpd.conf <<'RULES'
+subnet 192.168.10.0 netmask 255.255.255.0 { range 192.168.10.100 192.168.10.200; option routers 192.168.10.1; option domain-name-servers 1.1.1.1; }
+subnet 192.168.20.0 netmask 255.255.255.0 { range 192.168.20.100 192.168.20.200; option routers 192.168.20.1; option domain-name-servers 1.1.1.1; }
+RULES
+# The rules name VLANs that do not exist yet. In brackets, PF looks the
+# addresses up as it goes, so they can be checked before the VLANs are there.
+check "the firewall accepts the files" ./fw check
+check "the deployment succeeds" deploy
+check "the firewall runs what this folder holds" in_sync
+check "a second pass changes nothing" nothing_to_do
+check "dhcpd is running" said dhcpd=running helper status
+
+# The client puts each VLAN in a routing table of its own, so that its SSH,
+# which arrives another way, is left alone.
+client 'doas sh -c "ifconfig vio1 up; for n in 10 20; do ifconfig vlan\$n create; ifconfig vlan\$n parent vio1 vnetid \$n rdomain \$((n / 10)); ifconfig vlan\$n inet autoconf; done"; sleep 10' >/dev/null 2>&1
+check "the client gets an address on VLAN 10" said 'inet 192.168.10.' client ifconfig vlan10
+check "the client gets an address on VLAN 20" said 'inet 192.168.20.' client ifconfig vlan20
+check "VLAN 10 reaches the internet" client route -T1 exec nc -zw5 1.1.1.1 443
+check "VLAN 20 reaches the internet" client route -T2 exec nc -zw5 1.1.1.1 443
+# Nothing listens on that port: "refused" means the packet got through.
+check "VLAN 10 may reach VLAN 20" said refused client route -T1 exec nc -zvw4 192.168.20.1 8080
+check "VLAN 20 may not reach VLAN 10" said 'timed out' client route -T2 exec nc -zvw4 192.168.10.1 8080
+
+step "A VLAN that cannot come up"
+good=$(fingerprint)
+printf 'parent em9 vnetid 30\ninet 192.168.30.1 255.255.255.0\n' >network/hostname.vlan30
+check "the deployment fails" deploy_fails
+check "it says why" grep -q SIOCSIFPARENT "$tmp/state/deploy.log"
+check "the firewall is as it was" unchanged
+check "nothing is left of the VLAN" fails firewall 'ifconfig vlan30 || ls /etc/hostname.vlan30'
+rm network/hostname.vlan30
+
+step "A change that takes the management port down"
+printf 'inet autoconf\ndown\n' >network/hostname.vio0
+check "the deployment fails" deploy_fails
+check "the watchdog brought the firewall back as it was" unchanged
+check "the rollback is on record" said watchdog helper status
+rm network/hostname.vio0
+
+step "Power lost between trying a change and keeping it"
+printf 'parent vio1 vnetid 10\ninet 192.168.99.1 255.255.255.0\nup\n' >network/hostname.vlan10
+check "the watchdog is armed" helper arm 300
+check "the change is tried" try_network
+check "the new address is in use" said 192.168.99.1 firewall ifconfig vlan10
+firewall sync
+kill -9 "$(cat "$vm_home/firewall.pid")"
+sleep 1
+check "the firewall starts again" "$vm" start firewall
+check "it is back on the old address" said 192.168.10.1 firewall ifconfig vlan10
+check "its files are the old ones" said 192.168.10.1 firewall cat /etc/hostname.vlan10
+check "nothing is waiting to be confirmed" said net_pending=0 helper status
+check "routing is still on" said forwarding=1 firewall sysctl net.inet.ip.forwarding
+check "dhcpd came back by itself" said dhcpd=running helper status
+printf 'parent vio1 vnetid 10\ninet 192.168.10.1 255.255.255.0\nup\n' >network/hostname.vlan10
+check "the next pass finds nothing to do" nothing_to_do
+
+step "Taking things away again"
+cp "$here/dhcp/dhcpd.conf" dhcp/dhcpd.conf
+rm network/hostname.vlan20
+sed -i '/vlan20/d' nat/20-nat.conf firewall/30-rules.conf
+check "the deployment succeeds" deploy
+check "the firewall runs what this folder holds" in_sync
+check "VLAN 20 is gone" fails firewall 'ifconfig vlan20 || ls /etc/hostname.vlan20'
+check "VLAN 10 is untouched" said 192.168.10.1 firewall ifconfig vlan10
+check "dhcpd is stopped" said dhcpd=stopped helper status
+check "its configuration is gone" said dhcpd_sha256=none helper status
+
+step "Factory reset"
+check "./factory-reset runs" env PATH="$tmp/bin:$PATH" "$work/factory-reset" -y firewall fcc-firewall
+check "the helper and its hook are gone" fails firewall 'ls /usr/local/sbin/fcc-pfctl || ls /etc/rc.local || id fccdeploy'
+check "the firewall keeps its addresses" said 192.168.10.1 firewall ifconfig vlan10
+
+echo
+if [ "$failures" -eq 0 ]; then
+	echo "Everything passed."
+else
+	echo "$failures failed."
+fi
+exit "$((failures > 0))"

@@ -16,6 +16,8 @@ CONFIG_FILE = "firewall.json"
 # Per-machine settings that must not be committed: where this machine keeps
 # the deployment key and the firewall's pinned host key.
 LOCAL_FILE = ".fw-local.json"
+# The folders the editor commits.
+CONFIG_FOLDERS = ("firewall", "nat", "dhcp", "network")
 
 
 class RemoteError(RuntimeError):
@@ -96,15 +98,27 @@ def git(root: Path, *arguments: str, check: bool = True) -> str:
     return result.stdout
 
 
+def _folders(root: Path) -> list[str]:
+    """The configuration folders git can be asked about: it refuses a path
+    that neither exists nor is tracked."""
+    return [
+        folder
+        for folder in CONFIG_FOLDERS
+        if (root / folder).exists() or git(root, "ls-files", "--", folder, check=False).strip()
+    ]
+
+
 def pending_changes(root: Path) -> str:
     """The uncommitted changes to the configuration, as a diff."""
-    git(root, "add", "--intent-to-add", "--", "firewall", "nat", "dhcp", check=False)
-    return git(root, "diff", "--", "firewall", "nat", "dhcp")
+    folders = _folders(root)
+    git(root, "add", "--intent-to-add", "--", *folders, check=False)
+    return git(root, "diff", "--", *folders)
 
 
 def commit(root: Path, message: str) -> str:
-    git(root, "add", "--", "firewall", "nat", "dhcp")
-    git(root, "commit", "-m", message, "--", "firewall", "nat", "dhcp")
+    folders = _folders(root)
+    git(root, "add", "--", *folders)
+    git(root, "commit", "-m", message, "--", *folders)
     return git(root, "rev-parse", "--short", "HEAD").strip()
 
 

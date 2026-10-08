@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""Builds and runs the OpenBSD machines this repository is tested against.
+
+    test/vm build              install OpenBSD once and keep a clean copy
+    test/vm start [NAME]       start a machine and wait for its SSH
+    test/vm stop [NAME]        shut a machine down
+    test/vm reset [NAME]       stop it and put the clean copy back
+    test/vm ssh NAME [CMD...]  log in as admin, or run a command
+    test/vm console NAME       attach to the serial console; Ctrl-] leaves
+    test/vm status             say what is running
+
+NAME is firewall (the default) or client. Both run under QEMU as your own
+user, and nothing listens beyond 127.0.0.1.
+
+    firewall  vio0  outside, QEMU's own NAT; SSH on 127.0.0.1:2222
+              vio1  the trunk, a wire to the client and nothing else
+    client    vio0  QEMU's own NAT, for SSH only, on 127.0.0.1:2223
+              vio1  the trunk
+
+Everything is kept in ~/fcc-vm, or in FCC_VM_DIR: the disks, the admin key,
+known_hosts, an ssh_config, the passwords, and each machine's console log.
+The serial console is the way in when a test has cut SSH off on purpose.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+RELEASE = "7.9"
+IMAGE = "install" + RELEASE.replace(".", "") + ".img"
+MIRROR = f"https://cdn.openbsd.org/pub/OpenBSD/{RELEASE}/amd64"
+DISK_SIZE = 16 * 1024**3
+
+HOME = Path(os.environ.get("FCC_VM_DIR", Path.home() / "fcc-vm")).expanduser().resolve()
+KEY = HOME / "admin_ed25519"
+KNOWN_HOSTS = HOME / "known_hosts"
+CLEAN = HOME / "clean.img"
+
+# The trunk is one UDP port per machine on this host, each sending to the other.
+MACHINES = {
+    "firewall": {"ssh": 2222, "mac": "52:54:00:fc:c0:0", "trunk": (27001, 27002)},
+    "client": {"ssh": 2223, "mac": "52:54:00:fc:c1:0", "trunk": (27002, 27001)},
+}
+
+
+def die(message: str) -> None:
+    sys.exit(f"vm: {message}")
+
+
+def say(message: str) -> None:
+    print(message, flush=True)
+
+
+def path(name: str, suffix: str) -> Path:
+    return HOME / f"{name}.{suffix}"
+
+
+def running(name: str) -> int | None:
+    """The process ID of the machine's QEMU, if it is running."""
+    try:
+        pid = int(path(name, "pid").read_text())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------------- QEMU
+
+
+def start_qemu(name: str, installer: bool = False) -> None:
+    machine = MACHINES[name]
+    local, remote = machine["trunk"]
+    console, monitor = path(name, "console"), path(name, "monitor")
+    for leftover in (console, monitor):
+        leftover.unlink(missing_ok=True)
+    command = [
+        "qemu-system-x86_64", "-name", f"fcc-{name}",
+        # Without graphics the BIOS and the boot loader talk on the serial port.
+        "-machine", "pc,accel=kvm,graphics=off", "-cpu", "host",
+        "-m", "1024", "-smp", "2", "-display", "none", "-rtc", "base=utc",
+        "-drive", f"file={path(name, 'img')},format=raw,if=none,id=disk",
+        "-device", f"virtio-blk-pci,drive=disk,bootindex={2 if installer else 1}",
+        "-netdev", f"user,id=outside,hostfwd=tcp:127.0.0.1:{machine['ssh']}-:22",
+        "-device", f"virtio-net-pci,netdev=outside,mac={machine['mac']}1",
+        "-netdev", "dgram,id=trunk,local.type=inet,local.host=127.0.0.1,"
+        f"local.port={local},remote.type=inet,remote.host=127.0.0.1,remote.port={remote}",
+        "-device", f"virtio-net-pci,netdev=trunk,mac={machine['mac']}2",
+        "-chardev", f"socket,id=console,path={console},server=on,wait=off,"
+        f"logfile={path(name, 'console.log')},logappend=on",
+        "-serial", "chardev:console",
+        "-monitor", f"unix:{monitor},server=on,wait=off",
+        "-pidfile", str(path(name, "pid")), "-daemonize",
+    ]
+    if installer:
+        # Restarting after the install would start the installer again;
+        # -no-reboot ends QEMU there instead.
+        command += [
+            "-drive", f"file={HOME / IMAGE},format=raw,if=none,id=media,readonly=on",
+            "-device", "virtio-blk-pci,drive=media,bootindex=1", "-no-reboot",
+        ]
+    subprocess.run(command, check=True)
+
+
+def stop(name: str, wait: int = 90) -> None:
+    pid = running(name)
+    if pid is None:
+        return
+    # The power button; OpenBSD shuts down cleanly when it is pressed.
+    monitor = socket.socket(socket.AF_UNIX)
+    try:
+        monitor.connect(str(path(name, "monitor")))
+        monitor.sendall(b"system_powerdown\n")
+        deadline = time.time() + wait
+        while running(name) and time.time() < deadline:
+            time.sleep(1)
+        if running(name):
+            say(f"{name} did not shut down in {wait} seconds; switching it off")
+            monitor.sendall(b"quit\n")
+            time.sleep(2)
+    finally:
+        monitor.close()
+    if running(name):
+        os.kill(pid, 9)
+
+
+class Console:
+    """The machine's serial console, for typing at and reading from."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.buffer = ""
+        self.socket = socket.socket(socket.AF_UNIX)
+        for _ in range(50):
+            try:
+                self.socket.connect(str(path(name, "console")))
+                return
+            except OSError:
+                time.sleep(0.1)
+        die(f"cannot reach the console of {name}")
+
+    def send(self, text: str) -> None:
+        self.socket.sendall(text.encode())
+
+    def expect(self, pattern: str, timeout: int = 60) -> re.Match:
+        """Reads until the pattern shows up, and forgets everything up to it."""
+        deadline = time.time() + timeout
+        while True:
+            found = re.search(pattern, self.buffer)
+            if found:
+                self.buffer = self.buffer[found.end():]
+                return found
+            left = deadline - time.time()
+            if left <= 0:
+                tail = "\n".join(self.buffer.splitlines()[-15:])
+                die(f"{self.name}: waited {timeout} seconds for {pattern!r}. The console last said:\n{tail}")
+            self.socket.settimeout(left)
+            try:
+                data = self.socket.recv(4096)
+            except TimeoutError:
+                continue
+            if not data:
+                die(f"{self.name}: the console closed while waiting for {pattern!r}")
+            self.buffer += data.decode(errors="replace")
+
+    def run(self, command: str, timeout: int = 60) -> None:
+        """Runs a shell command and stops unless it succeeds."""
+        # What is typed comes back too, but as $?, never as a number.
+        self.send(command + "; echo __done__$?\r")
+        if self.expect(r"__done__(\d+)", timeout).group(1) != "0":
+            die(f"{self.name}: this failed on the console: {command}")
+
+
+# ------------------------------------------------------------------ build
+
+
+def fetch_image() -> None:
+    image = HOME / IMAGE
+    if not image.exists():
+        say(f"Downloading {MIRROR}/{IMAGE}")
+        urllib.request.urlretrieve(f"{MIRROR}/{IMAGE}", image.with_suffix(".part"))
+        image.with_suffix(".part").rename(image)
+    with urllib.request.urlopen(f"{MIRROR}/SHA256") as answer:
+        listed = re.search(rf"\({re.escape(IMAGE)}\) = (\w+)", answer.read().decode())
+    with image.open("rb") as file:
+        actual = hashlib.file_digest(file, "sha256").hexdigest()
+    # The list comes over HTTPS from the same place; its signature is not
+    # checked, because signify is not something a Linux machine has.
+    if not listed or listed.group(1) != actual:
+        die(f"{image} does not match the SHA256 published for it. Delete it and build again.")
+
+
+def answers(password: str, public_key: str) -> list[str]:
+    """What the installer is told; it uses its own default for the rest."""
+    return [
+        "System hostname = firewall",
+        "Which network interface do you wish to configure = vio0",
+        "IPv4 address for vio0 = autoconf",
+        "IPv6 address for vio0 = none",
+        f"Password for root account = {password}",
+        "Start sshd(8) by default = yes",
+        "Do you expect to run the X Window System = no",
+        "Change the default console to com0 = yes",
+        "Which speed should com0 use = 115200",
+        "Setup a user = admin",
+        "Full name for user admin = Test administrator",
+        f"Password for user admin = {password}",
+        f"Public ssh key for user admin = {public_key}",
+        "Allow root ssh login = no",
+        "What timezone are you in = UTC",
+        "Which disk is the root disk = sd0",
+        "Use (W)hole disk MBR, whole disk (G)PT or (E)dit = whole",
+        "Use (A)uto layout, (E)dit auto layout, or create (C)ustom layout = a",
+        "Location of sets = disk",
+        "Is the disk partition already mounted = no",
+        "Which disk contains the install media = sd1",
+        "Which sd1 partition has the install sets = a",
+        f"Pathname to the sets = {RELEASE}/amd64",
+        "Set name(s) = -x* -game* -comp*",
+        "Directory does not contain SHA256.sig. Continue without verification = yes",
+    ]
+
+
+def build() -> None:
+    if CLEAN.exists():
+        die(f"{CLEAN} is already built. Delete it to build again.")
+    for program in ("qemu-system-x86_64", "ssh-keygen", "socat"):
+        shutil.which(program) or die(f"{program} is not installed")
+    os.access("/dev/kvm", os.R_OK | os.W_OK) or die("this user cannot use /dev/kvm")
+    HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stop("firewall")
+    fetch_image()
+
+    if not KEY.exists():
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "fcc-vm-admin", "-f", str(KEY)], check=True)
+    public_key = subprocess.run(["ssh-keygen", "-y", "-f", str(KEY)], check=True, capture_output=True, text=True).stdout.strip()
+    credentials = HOME / "credentials"
+    if not credentials.exists():
+        credentials.touch(mode=0o600)
+        credentials.write_text(f"root and admin, on every machine: {secrets.token_hex(12)}\n")
+    password = credentials.read_text().split()[-1]
+
+    disk = path("firewall", "img")
+    disk.unlink(missing_ok=True)
+    with disk.open("wb") as file:
+        file.truncate(DISK_SIZE)
+    path("firewall", "console.log").unlink(missing_ok=True)
+
+    say("Starting the installer")
+    start_qemu("firewall", installer=True)
+    console = Console("firewall")
+    console.expect(r"boot>")
+    console.send("set tty com0\r")
+    console.expect(r"boot>")
+    console.send("\r")
+    console.expect(r"\(I\)nstall, \(U\)pgrade, \(A\)utoinstall or \(S\)hell\?", 180)
+    console.send("S\r")
+    for line in answers(password, public_key):
+        console.run(f"echo '{line}' >>/tmp/answers")
+    say(f"Installing OpenBSD {RELEASE}; follow it in {path('firewall', 'console.log')}")
+    console.send("install -af /tmp/answers\r")
+    console.expect(r"CONGRATULATIONS!", 1800)
+    console.send("reboot\r")
+    for _ in range(120):
+        if not running("firewall"):
+            break
+        time.sleep(1)
+    else:
+        die("the installer finished, but the machine did not restart")
+
+    say("Installed. Waiting for its first start")
+    start_qemu("firewall")
+    console = Console("firewall")
+    console.expect(r"login: ", 900)
+    console.send("root\r")
+    console.expect(r"Password:")
+    console.send(password + "\r")
+    # Anything typed before the shell is ready is thrown away.
+    console.expect(r"firewall# ")
+    # ./setup needs an account that can use doas; OpenBSD ships none.
+    console.run("echo 'permit nopass :wheel' >/etc/doas.conf && chmod 600 /etc/doas.conf")
+    # The first start relinks the kernel in the background. Let it finish, so
+    # the clean copy is not caught halfway.
+    console.run("while pgrep -qf reorder_kernel; do sleep 2; done", 900)
+    console.send("echo __key__$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)__\r")
+    host_key = console.expect(r"__key__(ssh-ed25519 [A-Za-z0-9+/=]+)__").group(1)
+    console.send("exit\r")
+
+    # Read over the console, so the key is pinned without trusting the network.
+    KNOWN_HOSTS.write_text("".join(f"[127.0.0.1]:{machine['ssh']} {host_key}\n" for machine in MACHINES.values()))
+    (HOME / "ssh_config").write_text("".join(
+        f"Host fcc-{name}\n  HostName 127.0.0.1\n  Port {machine['ssh']}\n  User admin\n"
+        f"  IdentityFile {KEY}\n  IdentitiesOnly yes\n  UserKnownHostsFile {KNOWN_HOSTS}\n"
+        for name, machine in MACHINES.items()
+    ))
+
+    say("Shutting down to keep a clean copy")
+    stop("firewall", wait=180)
+    subprocess.run(["cp", "--sparse=always", str(disk), str(CLEAN)], check=True)
+    say(f"Built. The clean copy is {CLEAN}; start a machine with: test/vm start")
+
+
+# --------------------------------------------------------------- everyday
+
+
+def ssh_command(name: str, *arguments: str) -> list[str]:
+    return ["ssh", "-F", str(HOME / "ssh_config"), *arguments, f"fcc-{name}"]
+
+
+def start(name: str) -> None:
+    CLEAN.exists() or die("there is no clean copy yet. Run: test/vm build")
+    if running(name):
+        say(f"{name} is already running")
+        return
+    fresh = not path(name, "img").exists()
+    if fresh:
+        subprocess.run(["cp", "--sparse=always", str(CLEAN), str(path(name, "img"))], check=True)
+    start_qemu(name)
+    for _ in range(90):
+        probe = subprocess.run(ssh_command(name, "-o", "ConnectTimeout=3", "-o", "BatchMode=yes") + ["true"], capture_output=True)
+        if probe.returncode == 0:
+            break
+        time.sleep(2)
+    else:
+        die(f"{name} started, but its SSH does not answer. Look at: test/vm console {name}")
+    if fresh and name != "firewall":
+        # The clean copy was installed as the firewall.
+        subprocess.run(ssh_command(name) + [f"doas sh -c 'echo {name} >/etc/myname && hostname {name}'"], check=True)
+    say(f"{name} is up: test/vm ssh {name}")
+
+
+def reset(name: str) -> None:
+    CLEAN.exists() or die("there is no clean copy yet. Run: test/vm build")
+    stop(name)
+    subprocess.run(["cp", "--sparse=always", str(CLEAN), str(path(name, "img"))], check=True)
+    say(f"{name} is a clean install again, and stopped")
+
+
+def status() -> None:
+    for name, machine in MACHINES.items():
+        pid = running(name)
+        state = f"running, process {pid}" if pid else "stopped" if path(name, "img").exists() else "not created"
+        say(f"{name:9} {state:22} SSH 127.0.0.1:{machine['ssh']}")
+
+
+def main() -> None:
+    arguments = sys.argv[1:]
+    command = arguments[0] if arguments else ""
+    name = arguments[1] if len(arguments) > 1 else "firewall"
+    if command in ("start", "stop", "reset", "ssh", "console") and name not in MACHINES:
+        die(f"there is no machine called {name}; there are {' and '.join(MACHINES)}")
+    if command == "build":
+        build()
+    elif command == "start":
+        start(name)
+    elif command == "stop":
+        stop(name)
+    elif command == "reset":
+        reset(name)
+    elif command == "status":
+        status()
+    elif command == "ssh" and len(arguments) > 1:
+        os.execvp("ssh", ssh_command(name) + arguments[2:])
+    elif command == "console" and len(arguments) > 1:
+        running(name) or die(f"{name} is not running")
+        os.execvp("socat", ["socat", "-,raw,echo=0,escape=0x1d", f"UNIX-CONNECT:{path(name, 'console')}"])
+    else:
+        sys.exit(__doc__.split("\n\n")[1])
+
+
+if __name__ == "__main__":
+    main()

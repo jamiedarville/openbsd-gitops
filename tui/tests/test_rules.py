@@ -85,6 +85,67 @@ class NatAndDhcpTests(unittest.TestCase):
             rules.dhcp_static_lease("printer; }", "00:11:22:33:44:55", "192.168.10.50")
 
 
+
+class NetworkTests(unittest.TestCase):
+    def test_a_vlan_is_three_lines_in_a_file_named_after_it(self):
+        address = rules.check_interface_address("192.168.10.1/24")
+        self.assertEqual(
+            rules.vlan_interface("em1", 10, address, "Office"),
+            (Path("network/hostname.vlan10"), ["# Office", "parent em1 vnetid 10", "inet 192.168.10.1 255.255.255.0", "up"]),
+        )
+
+    def test_rejects_addresses_and_ports_that_cannot_work(self):
+        for bad in ("192.168.10.1", "192.168.10.0/24", "192.168.10.255/24", "10.0.0.1/31", "2001:db8::1/64", "x"):
+            with self.subTest(bad), self.assertRaises(rules.InvalidInput):
+                rules.check_interface_address(bad)
+        for bad in ("vlan10", "lo0", "em", "em1; id", "Em1"):
+            with self.subTest(bad), self.assertRaises(rules.InvalidInput):
+                rules.check_port(bad)
+        for bad in ("0", "4095", "ten"):
+            with self.subTest(bad), self.assertRaises(rules.InvalidInput):
+                rules.check_vlan_number(bad)
+
+    def test_the_dhcp_range_avoids_the_firewall(self):
+        suggest = lambda value: rules.dhcp_range(rules.check_interface_address(value))
+        self.assertEqual(suggest("192.168.10.1/24"), ("192.168.10.100", "192.168.10.200"))
+        self.assertEqual(suggest("192.168.10.200/24"), ("192.168.10.100", "192.168.10.199"))
+        self.assertEqual(suggest("10.0.0.1/28"), ("10.0.0.8", "10.0.0.14"))
+        self.assertEqual(suggest("10.0.0.9/28"), ("10.0.0.10", "10.0.0.14"))
+
+    def test_routing_is_one_line_switched_on_and_off(self):
+        self.assertEqual(rules.with_routing(["# note"], True), ["# note", "net.inet.ip.forwarding=1"])
+        self.assertEqual(rules.with_routing(["# note", "net.inet.ip.forwarding=1"], False), ["# note"])
+        self.assertEqual(rules.with_routing(["net.inet.ip.forwarding=0"], True), ["net.inet.ip.forwarding=1"])
+
+    def test_addresses_of_an_interface_macros_and_tables(self):
+        for good in ("(vlan10:network)", "vlan10:network", "(egress)", "$lan"):
+            self.assertEqual(rules.check_address(good), good)
+        for bad in ("(vlan10:network", "vlan10:netwrk", "vlan10", "$(id)"):
+            with self.subTest(bad), self.assertRaises(rules.InvalidInput):
+                rules.check_address(bad)
+        self.assertEqual(rules.macro("lan", "vlan10"), 'lan = "vlan10"')
+        self.assertEqual(rules.table("<admins>", "192.0.2.10, 10.1.2.3/8"), "table <admins> { 192.0.2.10, 10.0.0.0/8 }")
+        with self.assertRaises(rules.InvalidInput):
+            rules.macro("lan", 'vlan10" pass all "')
+
+    def test_joins_the_network_files_as_the_firewall_reports_them(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "network").mkdir()
+            self.assertEqual(rules.assemble_network(root), "# openbsd-gitops network\n")
+            (root / "network/hostname.vlan10").write_text("parent em1 vnetid 10\nup")
+            (root / "network/hostname.em1").write_text("up\n")
+            (root / "network/hostname.vlan10.bak").write_text("ignored\n")
+            (root / "network/sysctl.conf").write_text("# only a comment\n")
+            self.assertEqual(
+                rules.assemble_network(root),
+                "# openbsd-gitops network\n# --- hostname.em1 ---\nup\n"
+                "# --- hostname.vlan10 ---\nparent em1 vnetid 10\nup\n",
+            )
+            (root / "network/sysctl.conf").write_text("net.inet.ip.forwarding=1\n")
+            self.assertTrue(rules.assemble_network(root).endswith("# --- sysctl.conf ---\nnet.inet.ip.forwarding=1\n"))
+
+
 class FileTests(unittest.TestCase):
     def test_line_operations(self):
         lines = ["# heading", "block all", "pass out"]

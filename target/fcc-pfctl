@@ -8,9 +8,14 @@
 # the previous policy until `commit`, so the watchdog, an explicit `rollback`,
 # or a reboot all restore the previous policy from the firewall itself.
 #
-# Every path below is fixed. Nothing the caller sends is used as a path, a
-# command, or an option; the only caller-supplied values are the rules on
-# standard input and the grace period, which must be a whole number of seconds.
+# Every path below is fixed. Nothing the caller sends is used as a command or
+# an option; the caller-supplied values are the configuration on standard
+# input and the grace period, which must be a whole number of seconds.
+#
+# The network configuration is the one place where the caller names files:
+# /etc/hostname.<interface>, /etc/sysctl.conf and /etc/mygate. netstart(8)
+# hands every line of a hostname file to the shell, so those lines are held to
+# plain words, and sysctl.conf to the settings listed below. See check_network.
 
 set -eu
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
@@ -23,6 +28,14 @@ CONF=/etc/pf.conf
 DHCPD=/usr/sbin/dhcpd
 DHCPD_CONF=/etc/dhcpd.conf
 RCCTL=/usr/sbin/rcctl
+IFCONFIG=/sbin/ifconfig
+SYSCTL=/sbin/sysctl
+ROUTE=/sbin/route
+NETSTART=/etc/netstart
+# The only settings a deployed sysctl.conf may hold.
+NET_SYSCTLS="net.inet.ip.forwarding net.inet6.ip6.forwarding"
+# The first line of a network configuration, as `fw assemble-network` writes it.
+NET_HEADER="# openbsd-gitops network"
 STATE=/var/db/fcc
 RUN=/var/run/fcc
 
@@ -106,8 +119,254 @@ armed_token() {
 	cut -d' ' -f1 <"$RUN/armed"
 }
 
-# Reloads the committed policy and clears every trace of the deployment.
+# ------------------------------------------------------------------ network
+
+# Splits a network configuration into one file per "# --- name ---" heading.
+unpack_network() {
+	rm -rf "$2"
+	mkdir "$2"
+	LC_ALL=C awk -v dir="$2" -v header="$NET_HEADER" '
+	NR == 1 { if ($0 != header) exit 3; next }
+	/^# --- (hostname\.[a-z]+[0-9]+|sysctl\.conf|mygate) ---$/ {
+		if ($3 in seen) exit 3
+		seen[$3] = 1
+		if (file != "") close(file)
+		file = dir "/" $3
+		printf "" >file
+		next
+	}
+	{ if (file == "") exit 3; print >file }
+	END { if (NR == 0) exit 3 }
+	' "$1" || fail 65 "the network configuration is not laid out as expected"
+}
+
+# Refuses anything in the unpacked configuration that could do more than
+# configure the network.
+check_network() {
+	for file in "$1"/*; do
+		[ -f "$file" ] || continue
+		name=${file##*/}
+		case "$name" in
+		hostname.*)
+			interface=${name#hostname.}
+			case "$interface" in
+			lo[0-9]* | enc[0-9]* | pflog[0-9]* | pfsync[0-9]*)
+				fail 65 "$name: this interface is not managed from here"
+				;;
+			vlan[0-9]*) ;;
+			*)
+				"$IFCONFIG" "$interface" >/dev/null 2>&1 ||
+					fail 65 "$name: the firewall has no interface $interface"
+				;;
+			esac
+			# netstart(8) runs a line starting with "!" as a command, and
+			# evaluates every other line in the shell. Comments aside, only
+			# words that mean nothing to a shell are let through.
+			if LC_ALL=C grep -Evq '^([[:blank:]]*#.*|[A-Za-z0-9[:blank:]._:/-]*)$' "$file"; then
+				fail 65 "$name: only letters, digits, spaces and . _ : / - are allowed outside comments"
+			fi
+			;;
+		sysctl.conf)
+			allowed=$(echo "$NET_SYSCTLS" | sed 's/\./\\./g; s/ /|/g')
+			if LC_ALL=C grep -Evq "^([[:blank:]]*#.*|[[:blank:]]*|($allowed)=[0-9]+)\$" "$file"; then
+				fail 65 "sysctl.conf: only these may be set, to a number: $NET_SYSCTLS"
+			fi
+			;;
+		mygate)
+			if LC_ALL=C grep -Evq '^([[:blank:]]*#.*|[[:blank:]]*|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$' "$file"; then
+				fail 65 "mygate: only an IPv4 address is allowed"
+			fi
+			;;
+		esac
+	done
+	# A sysctl.conf written by hand may hold settings that would be lost.
+	if [ -f "$1/sysctl.conf" ] && [ -f /etc/sysctl.conf ] && ! managed sysctl.conf; then
+		allowed=$(echo "$NET_SYSCTLS" | sed 's/\./\\./g; s/ /|/g')
+		if LC_ALL=C grep -Evq "^([[:blank:]]*#.*|[[:blank:]]*|($allowed)=[0-9]+)\$" /etc/sysctl.conf; then
+			fail 73 "/etc/sysctl.conf on the firewall has settings that cannot be kept from here; remove them first"
+		fi
+	fi
+}
+
+# True if this helper installed the named file.
+managed() {
+	[ -f "$STATE/net-managed" ] && grep -qxF "$1" "$STATE/net-managed"
+}
+
+# The files this helper installed, written out the way they were sent. Its
+# digest equals that of the repository's network files while nothing on the
+# firewall has been changed by hand.
+installed_network() {
+	echo "$NET_HEADER"
+	[ -f "$STATE/net-managed" ] || return 0
+	while read -r name; do
+		echo "# --- $name ---"
+		[ ! -f "/etc/$name" ] || cat "/etc/$name"
+	done <"$STATE/net-managed"
+}
+
+network_digest() {
+	echo "sha256:$(installed_network | "$SHA256" -q)"
+}
+
+vlans() {
+	"$IFCONFIG" vlan 2>/dev/null | sed -n 's/^\(vlan[0-9]*\):.*/\1/p'
+}
+
+default_gateway() {
+	"$ROUTE" -n get -inet default 2>/dev/null | awk '$1 == "gateway:" { print $2 }'
+}
+
+# Brings the running network in line with the named files in /etc. What
+# netstart says goes to a log; it reports problems only by printing them.
+activate_network() {
+	# Ports first: a VLAN needs its parent.
+	for name; do
+		case "$name" in
+		hostname.vlan*) ;;
+		hostname.*)
+			[ ! -f "/etc/$name" ] || sh "$NETSTART" "${name#hostname.}" 2>&1 || true
+			;;
+		esac
+	done
+	for name; do
+		case "$name" in
+		hostname.vlan*)
+			interface=${name#hostname.}
+			# Rebuilt from nothing, so that what its file no longer says
+			# does not linger.
+			"$IFCONFIG" "$interface" destroy 2>/dev/null || true
+			[ ! -f "/etc/$name" ] || sh "$NETSTART" "$interface" 2>&1 || true
+			;;
+		esac
+	done
+}
+
+# Saves everything a network change is about to touch, then says so with the
+# net-pending marker. It is kept in /var/db so that it outlives a reboot.
+save_network() {
+	previous="$STATE/net-previous"
+	rm -rf "$previous"
+	mkdir -p "$previous/files"
+	{
+		ls "$1"
+		[ ! -f "$STATE/net-managed" ] || cat "$STATE/net-managed"
+	} | LC_ALL=C sort -u >"$previous/names"
+	while read -r name; do
+		[ ! -f "/etc/$name" ] || cp -p "/etc/$name" "$previous/files/$name"
+	done <"$previous/names"
+	[ ! -f "$STATE/net-managed" ] || cp "$STATE/net-managed" "$previous/managed"
+	vlans >"$previous/vlans"
+	# The ports that are up now. A file that says nothing either way would
+	# leave a port down that the change had taken down.
+	while read -r name; do
+		case "$name" in
+		hostname.vlan*) ;;
+		hostname.*)
+			! "$IFCONFIG" "${name#hostname.}" 2>/dev/null | head -1 | grep -q '<UP[,>]' ||
+				echo "${name#hostname.}"
+			;;
+		esac
+	done <"$previous/names" >"$previous/up"
+	for setting in $NET_SYSCTLS; do
+		echo "$setting=$("$SYSCTL" -n "$setting")"
+	done >"$previous/sysctls"
+	default_gateway >"$previous/gateway"
+	sync
+	touch "$STATE/net-pending"
+}
+
+# Puts the files of the unpacked configuration in /etc, removes the ones this
+# helper installed that are no longer wanted, and prints what changed.
+install_network() {
+	while read -r name; do
+		if [ -f "$1/$name" ]; then
+			! cmp -s "$1/$name" "/etc/$name" || continue
+			mode=0644
+			case "$name" in hostname.*) mode=0640 ;; esac
+			install -o root -g wheel -m "$mode" "$1/$name" "/etc/$name.fcc-new"
+			mv -f "/etc/$name.fcc-new" "/etc/$name"
+		else
+			[ -f "/etc/$name" ] || continue
+			rm -f "/etc/$name"
+		fi
+		echo "$name"
+	done <"$STATE/net-previous/names"
+}
+
+# Applies the settings and the default route that changed files ask for.
+apply_network_settings() {
+	for name; do
+		case "$name" in
+		sysctl.conf)
+			for setting in $NET_SYSCTLS; do
+				value=$(sed -n "s/^$setting=//p" /etc/sysctl.conf 2>/dev/null | tail -1)
+				"$SYSCTL" -q "$setting=${value:-0}"
+			done
+			;;
+		mygate)
+			gateway=$(grep -E '^[0-9]' /etc/mygate 2>/dev/null | head -1 || true)
+			if [ -n "$gateway" ]; then
+				"$ROUTE" -qn delete -inet default >/dev/null 2>&1 || true
+				"$ROUTE" -qn add -inet default "$gateway"
+			fi
+			;;
+		esac
+	done
+}
+
+# Undoes a network change that was never confirmed: the files, the VLANs it
+# created, the settings and the default route. Does nothing otherwise.
+restore_network() {
+	[ -f "$STATE/net-pending" ] || return 0
+	previous="$STATE/net-previous"
+	changed=$(
+		while read -r name; do
+			if [ -f "$previous/files/$name" ]; then
+				! cmp -s "$previous/files/$name" "/etc/$name" || continue
+				cp -p "$previous/files/$name" "/etc/$name.fcc-new"
+				mv -f "/etc/$name.fcc-new" "/etc/$name"
+			else
+				[ -f "/etc/$name" ] || continue
+				rm -f "/etc/$name"
+			fi
+			echo "$name"
+		done <"$previous/names"
+	)
+	if [ -f "$previous/managed" ]; then
+		cp "$previous/managed" "$STATE/net-managed"
+	else
+		rm -f "$STATE/net-managed"
+	fi
+	for interface in $(vlans); do
+		grep -qxF "$interface" "$previous/vlans" || "$IFCONFIG" "$interface" destroy || true
+	done
+	# shellcheck disable=SC2086
+	activate_network $changed >>"$STATE/net.log" 2>&1 || true
+	while read -r interface; do
+		"$IFCONFIG" "$interface" up || true
+	done <"$previous/up"
+	while read -r setting; do
+		"$SYSCTL" -q "$setting" || true
+	done <"$previous/sysctls"
+	case " $(echo $changed) " in
+	*" mygate "*)
+		gateway=$(cat "$previous/gateway")
+		if [ -n "$gateway" ]; then
+			"$ROUTE" -qn delete -inet default >/dev/null 2>&1 || true
+			"$ROUTE" -qn add -inet default "$gateway" || true
+		fi
+		;;
+	esac
+	rm -rf "$previous" "$STATE/net-stage"
+	rm -f "$STATE/net-pending"
+}
+
+# Reloads the committed policy and clears every trace of the deployment. The
+# network goes back first, so the rules find the interfaces they were written
+# for.
 restore_committed() {
+	restore_network
 	"$PFCTL" -f "$CONF"
 	record_loaded "$(digest "$CONF")"
 	cp "$STATE/loaded" "$STATE/saved"
@@ -175,6 +434,46 @@ watchdog)
 	fi
 	;;
 
+net-validate)
+	[ "$#" -eq 1 ] || fail 64 "net-validate takes no arguments"
+	candidate=$(read_candidate)
+	stage="$STATE/net-check.$$"
+	trap 'rm -rf "$candidate" "$stage"' EXIT
+	unpack_network "$candidate" "$stage"
+	check_network "$stage"
+	echo "candidate_sha256=$(digest "$candidate")"
+	;;
+
+net-apply)
+	[ "$#" -eq 1 ] || fail 64 "net-apply takes no arguments"
+	candidate=$(read_candidate)
+	lock
+	trap 'rm -f "$candidate"; unlock' EXIT
+	# Changing an address can cut the very connection this runs over. Carry
+	# on regardless: a half-applied change is worse than a finished one, and
+	# the watchdog undoes either.
+	trap '' HUP PIPE
+	[ -f "$RUN/armed" ] || fail 69 "refusing to apply without an armed rollback watchdog"
+	[ ! -f "$STATE/net-pending" ] || fail 73 "an earlier network change is still waiting to be confirmed"
+	stage="$STATE/net-stage"
+	unpack_network "$candidate" "$stage"
+	check_network "$stage"
+	save_network "$stage"
+	changed=$(install_network "$stage")
+	ls "$stage" | LC_ALL=C sort >"$STATE/net-managed"
+	rm -rf "$stage"
+	# shellcheck disable=SC2086
+	activate_network $changed >"$STATE/net.log" 2>&1
+	# shellcheck disable=SC2086
+	apply_network_settings $changed >>"$STATE/net.log" 2>&1 ||
+		fail 70 "a setting or the default route could not be applied"
+	if [ -s "$STATE/net.log" ]; then
+		cat "$STATE/net.log" >&2 || true
+		fail 70 "the firewall could not bring the network up as written"
+	fi
+	echo "net_sha256=$(network_digest)" || true
+	;;
+
 apply)
 	[ "$#" -eq 1 ] || fail 64 "apply takes no arguments"
 	candidate=$(read_candidate)
@@ -198,18 +497,27 @@ commit)
 	[ "$#" -eq 1 ] || fail 64 "commit takes no arguments"
 	lock
 	[ -f "$RUN/armed" ] || fail 69 "nothing to commit: the watchdog is not armed"
-	[ -f "$STATE/applied.conf" ] || fail 69 "nothing to commit: no rules were applied"
-	cp -p "$CONF" "$CONF.fcc-previous"
-	cp "$STATE/applied.conf" "$CONF.fcc-new"
-	chmod 600 "$CONF.fcc-new"
-	"$PFCTL" -nf "$CONF.fcc-new"
-	# A rename within /etc, so /etc/pf.conf is always a complete file.
-	mv -f "$CONF.fcc-new" "$CONF"
-	# What `apply` recorded now describes /etc/pf.conf too. Kept apart from
-	# "loaded" so it survives the next apply, and a reboot is still recognized.
-	[ ! -f "$STATE/loaded" ] || cp "$STATE/loaded" "$STATE/saved"
+	[ -f "$STATE/applied.conf" ] || [ -f "$STATE/net-pending" ] ||
+		fail 69 "nothing to commit: nothing was applied"
+	if [ -f "$STATE/applied.conf" ]; then
+		cp -p "$CONF" "$CONF.fcc-previous"
+		cp "$STATE/applied.conf" "$CONF.fcc-new"
+		chmod 600 "$CONF.fcc-new"
+		"$PFCTL" -nf "$CONF.fcc-new"
+		# A rename within /etc, so /etc/pf.conf is always a complete file.
+		mv -f "$CONF.fcc-new" "$CONF"
+		# What `apply` recorded now describes /etc/pf.conf too. Kept apart
+		# from "loaded" so it survives the next apply, and a reboot is still
+		# recognized.
+		[ ! -f "$STATE/loaded" ] || cp "$STATE/loaded" "$STATE/saved"
+	fi
+	# The network files are in /etc already; dropping the marker is what makes
+	# them stay.
+	rm -f "$STATE/net-pending"
+	rm -rf "$STATE/net-previous"
 	rm -f "$RUN/armed" "$STATE/applied.conf"
 	echo "committed_sha256=$(digest "$CONF")"
+	echo "net_sha256=$(network_digest)"
 	;;
 
 rollback)
@@ -217,6 +525,15 @@ rollback)
 	lock
 	restore_committed explicit
 	echo "committed_sha256=$(digest "$CONF")"
+	echo "net_sha256=$(network_digest)"
+	;;
+
+boot)
+	# Run from /etc/rc.local. A network change that was never confirmed has
+	# no watchdog left after a restart, so it is undone here.
+	[ "$#" -eq 1 ] || fail 64 "boot takes no arguments"
+	lock
+	[ ! -f "$STATE/net-pending" ] || restore_committed boot
 	;;
 
 status)
@@ -260,6 +577,22 @@ status)
 	else
 		echo "dhcpd_sha256=none"
 	fi
+	if [ -f "$STATE/dhcpd-managed" ]; then
+		echo "dhcpd_managed=1"
+	else
+		echo "dhcpd_managed=0"
+	fi
+	if "$RCCTL" check dhcpd >/dev/null 2>&1; then
+		echo "dhcpd=running"
+	else
+		echo "dhcpd=stopped"
+	fi
+	echo "net_sha256=$(network_digest)"
+	if [ -f "$STATE/net-pending" ]; then
+		echo "net_pending=1"
+	else
+		echo "net_pending=0"
+	fi
 	;;
 
 dhcpd-apply)
@@ -279,18 +612,36 @@ dhcpd-apply)
 	chmod 644 "$DHCPD_CONF.fcc-new"
 	mv -f "$DHCPD_CONF.fcc-new" "$DHCPD_CONF"
 	rm -f "$candidate"
-	# Restart only a dhcpd that is already running; enabling the service is
-	# the administrator's decision.
+	# Remembered, so that dhcpd-remove only ever takes away a configuration
+	# that came from here.
+	touch "$STATE/dhcpd-managed"
+	# A configuration in the repository means the service is wanted: it is
+	# switched on for the next start as well. dhcpd only listens on the
+	# interfaces that exist when it starts, so it is always started afresh.
+	"$RCCTL" enable dhcpd
 	if "$RCCTL" check dhcpd >/dev/null 2>&1; then
-		"$RCCTL" restart dhcpd >/dev/null
+		"$RCCTL" restart dhcpd >/dev/null || fail 70 "dhcpd did not start; does an interface have an address in each subnet?"
 		echo "dhcpd=restarted"
 	else
-		echo "dhcpd=not_running"
+		"$RCCTL" start dhcpd >/dev/null || fail 70 "dhcpd did not start; does an interface have an address in each subnet?"
+		echo "dhcpd=started"
 	fi
 	echo "dhcpd_sha256=$(digest "$DHCPD_CONF")"
 	;;
 
+dhcpd-remove)
+	[ "$#" -eq 1 ] || fail 64 "dhcpd-remove takes no arguments"
+	lock
+	[ -f "$STATE/dhcpd-managed" ] || fail 69 "the DHCP configuration on the firewall did not come from here"
+	if "$RCCTL" check dhcpd >/dev/null 2>&1; then
+		"$RCCTL" stop dhcpd >/dev/null
+	fi
+	"$RCCTL" disable dhcpd
+	rm -f "$DHCPD_CONF" "$DHCPD_CONF.fcc-previous" "$STATE/dhcpd-managed"
+	echo "dhcpd_sha256=none"
+	;;
+
 *)
-	fail 64 "usage: fcc-pfctl validate|backup|arm <seconds>|apply|commit|rollback|status|dhcpd-apply"
+	fail 64 "usage: fcc-pfctl validate|backup|arm <seconds>|apply|commit|rollback|status|dhcpd-apply|dhcpd-remove|net-validate|net-apply|boot"
 	;;
 esac

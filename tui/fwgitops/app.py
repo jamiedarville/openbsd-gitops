@@ -84,6 +84,116 @@ def dhcp_wizard(screen) -> str:
     )
 
 
+def settings_wizard(screen) -> str:
+    title = "New setting"
+    kind = ui.choose(
+        screen,
+        f"{title} — what kind?",
+        ["Macro: a name for an interface or address, used as $name", "Table: a named list of addresses, used as <name>"],
+    )
+    if kind == 0:
+        return rules.macro(
+            ui.text_input(screen, title, "Name", hint="Example: lan"),
+            ui.text_input(screen, title, "Stands for", hint="Example: vlan10"),
+        )
+    return rules.table(
+        ui.text_input(screen, title, "Name", hint="Example: admins"),
+        ui.text_input(screen, title, "Addresses", hint="Example: 192.0.2.10 10.0.0.0/8"),
+    )
+
+
+def _append(root: Path, relative: Path, line: str) -> None:
+    path = root / relative
+    rules.write_lines(path, rules.add_line(rules.read_lines(path), line))
+
+
+def vlan_wizard(screen, root: Path) -> None:
+    """Creates a VLAN, and on request everything a network behind it needs."""
+    title = "New VLAN"
+    port = ui.ask(
+        screen, title, "Port that carries it", rules.check_port, hint="The port the switch is plugged into. Example: em1"
+    )
+    number = ui.ask(screen, title, "VLAN number", rules.check_vlan_number, hint="1 to 4094, as set on the switch")
+    if (root / rules.NETWORK_FOLDER / f"hostname.vlan{number}").exists():
+        raise rules.InvalidInput(f"VLAN {number} is already there. Change its file under Networks.")
+    address = ui.ask(
+        screen, title, "The firewall's address on it", rules.check_interface_address, hint="Example: 192.168.10.1/24"
+    )
+    comment = ui.ask(screen, title, "What is this network for?", rules.check_comment, hint="Example: Office")
+    with_dhcp = _yes_no(screen, title, "hand out addresses on it by DHCP?")
+    dns = "1.1.1.1 9.9.9.9"
+    if with_dhcp:
+        dns = ui.text_input(screen, title, "DNS servers to hand out", default=dns)
+    with_internet = _yes_no(screen, title, "let it reach the internet?")
+
+    interface = f"vlan{number}"
+    own = f"({interface}:network)"
+    label = comment or f"VLAN {number}"
+    # Everything is worked out before anything is written.
+    file, lines = rules.vlan_interface(port, number, address, comment)
+    subnet = rules.dhcp_subnet(str(address.network), *rules.dhcp_range(address), str(address.ip), dns) if with_dhcp else ""
+    nat = rules.outbound_nat("egress", own, label) if with_internet else ""
+    allow = rules.FilterRule(interface=interface, protocol="any", source=own, comment=label).render() if with_internet else ""
+
+    written = [str(file)]
+    rules.write_lines(root / file, lines)
+    port_file = rules.NETWORK_FOLDER / f"hostname.{port}"
+    if not (root / port_file).exists():
+        # A VLAN carries nothing until the port under it is up.
+        rules.write_lines(root / port_file, ["up"])
+        written.append(str(port_file))
+    if with_dhcp:
+        _append(root, rules.DHCP_FILE, subnet)
+        written.append(str(rules.DHCP_FILE))
+    if with_internet:
+        _append(root, rules.NAT_FILE, nat)
+        _append(root, rules.RULES_FILE, allow)
+        written += [str(rules.NAT_FILE), str(rules.RULES_FILE)]
+        if not rules.routing_is_on(root):
+            sysctl = root / rules.SYSCTL_FILE
+            rules.write_lines(sysctl, rules.with_routing(rules.read_lines(sysctl), True))
+            written.append(f"{rules.SYSCTL_FILE} (routing switched on)")
+    ui.message(
+        screen,
+        title,
+        f"VLAN {number} is written, as {interface} on {port} with {address}.\n\nChanged:\n  "
+        + "\n  ".join(written)
+        + "\n\nOther networks cannot reach it, and it cannot reach them, unless a firewall rule says so."
+        "\nNothing is on the firewall until you save and deploy.",
+    )
+
+
+def _network_line(screen) -> str:
+    return ui.text_input(screen, "New line", "Line", hint="As in hostname.if(5). Example: inet 192.168.10.1 255.255.255.0")
+
+
+def network_menu(screen, root: Path) -> None:
+    heading = "Networks"
+    selected = 0
+    while True:
+        files = [path.name for path in rules.network_files(root) if path.name.startswith("hostname.")]
+        routing = rules.routing_is_on(root)
+        options = [
+            "Add a VLAN",
+            f"Routing between networks: {'on' if routing else 'off'} (Enter switches it)",
+            *[f"Change {name}" for name in files],
+        ]
+        selected = ui.choose(screen, heading, options, min(selected, len(options) - 1))
+        if selected == 0:
+            try:
+                vlan_wizard(screen, root)
+            except ui.Cancelled:
+                continue
+            except rules.InvalidInput as problem:
+                ui.message(screen, heading, f"That was not saved:\n\n{problem}")
+        elif selected == 1:
+            sysctl = root / rules.SYSCTL_FILE
+            rules.write_lines(sysctl, rules.with_routing(rules.read_lines(sysctl), not routing))
+        else:
+            name = files[selected - 2]
+            edit_file(screen, root, rules.NETWORK_FOLDER / name, name, _network_line)
+
+
 # -------------------------------------------------------------------- screens
 
 
@@ -143,17 +253,29 @@ def review(screen, root: Path) -> None:
 
 
 def check_on_firewall(screen, root: Path) -> bool:
-    """Asks the firewall to parse the rules. Nothing is loaded."""
-    pf_conf = rules.assemble_pf(root)
-    try:
-        answer = remote.run_helper(remote.load_firewall(root), "validate", stdin=pf_conf)
-    except remote.RemoteError as problem:
-        ui.message(screen, "The firewall rejected these rules", f"{problem}\n\nNothing was changed on the firewall.")
-        return False
-    if answer.get("candidate_sha256") != rules.digest(pf_conf):
-        ui.message(screen, "Check failed", "The firewall received something different from what was sent.")
-        return False
-    ui.message(screen, "Check passed", "The firewall accepts these rules.\n\nNothing was changed on the firewall.")
+    """Asks the firewall to check the rules and the network files. Nothing is loaded."""
+    firewall = remote.load_firewall(root)
+    checks = [("validate", "rules", rules.assemble_pf(root))]
+    if rules.network_files(root):
+        checks.append(("net-validate", "network files", rules.assemble_network(root)))
+    for operation, what, text in checks:
+        try:
+            answer = remote.run_helper(firewall, operation, stdin=text)
+        except remote.RemoteError as problem:
+            hint = ""
+            if "no IP address found" in str(problem):
+                hint = (
+                    "\n\nA rule uses the address of an interface the firewall does not have yet."
+                    "\nWrite it in brackets, like (vlan10:network), and PF looks it up as it goes."
+                )
+            ui.message(
+                screen, f"The firewall rejected these {what}", f"{problem}{hint}\n\nNothing was changed on the firewall."
+            )
+            return False
+        if answer.get("candidate_sha256") != rules.digest(text):
+            ui.message(screen, "Check failed", "The firewall received something different from what was sent.")
+            return False
+    ui.message(screen, "Check passed", "The firewall accepts this configuration.\n\nNothing was changed on the firewall.")
     return True
 
 
@@ -172,7 +294,7 @@ def save(screen, root: Path) -> None:
             "no rule seems to allow SSH in. The firewall would undo a lockout by itself, but save anyway?",
         ):
             return
-    if _yes_no(screen, title, "check the rules on the firewall first?") and not check_on_firewall(screen, root):
+    if _yes_no(screen, title, "check it on the firewall first?") and not check_on_firewall(screen, root):
         return
 
     description = ui.ask(screen, title, "Describe this change", _required, hint="This becomes the Git commit message")
@@ -215,6 +337,14 @@ def status(screen, root: Path) -> None:
         else:
             lines.append("Warning: the running rules differ from the firewall's own saved file.")
         lines += ["", f"This folder:      {wanted}", f"Firewall saved:   {saved}", f"Firewall running: {live}"]
+        # A helper from before network support says nothing about these.
+        if "net_sha256" in answer:
+            same = answer["net_sha256"] == rules.digest(rules.assemble_network(root))
+            lines += ["", "Network files:    " + ("the same as in this folder" if same else "different from this folder")]
+            if answer.get("net_pending") == "1":
+                lines.append("A network change is on trial and will be undone unless it is confirmed.")
+        if answer.get("dhcpd_managed") == "1":
+            lines.append(f"DHCP server:      {answer.get('dhcpd', 'unknown')}")
         lines += ["", f"Last rollback on the firewall: {answer.get('last_rollback', 'none')}"]
     except (remote.RemoteError, OSError, KeyError, ValueError) as problem:
         lines.append(f"Could not ask the firewall: {problem}")
@@ -227,11 +357,13 @@ def main_menu(screen, root: Path) -> None:
     curses.curs_set(0)
     screen.keypad(True)
     entries = [
+        ("Networks: VLANs and routing", lambda: network_menu(screen, root)),
         ("Firewall rules", lambda: firewall_menu(screen, root)),
         ("NAT and port forwards", lambda: edit_file(screen, root, rules.NAT_FILE, "NAT", nat_wizard)),
         ("DHCP", lambda: edit_file(screen, root, rules.DHCP_FILE, "DHCP", dhcp_wizard)),
+        ("Settings: macros and tables", lambda: edit_file(screen, root, rules.SETTINGS_FILE, "Settings", settings_wizard)),
         ("Review changes", lambda: review(screen, root)),
-        ("Check rules on the firewall (changes nothing)", lambda: check_on_firewall(screen, root)),
+        ("Check on the firewall (changes nothing)", lambda: check_on_firewall(screen, root)),
         ("Save and deploy", lambda: save(screen, root)),
         ("Status", lambda: status(screen, root)),
         ("Quit", None),

@@ -4,9 +4,9 @@
 # through deploy/fw-helper, which calls the one privileged command the
 # deployment account is allowed to run. No Python is needed on the firewall.
 #
-# New rules are loaded into the running firewall first and saved only after a
-# fresh SSH connection still works. If they lock the deployment out, the
-# firewall restores its previous rules by itself when the grace period ends.
+# New rules and network files are tried on the running firewall first and kept
+# only after a fresh SSH connection still works. If they lock the deployment
+# out, the firewall restores what it had by itself when the grace period ends.
 
 - name: Deploy the firewall configuration
   hosts: localhost
@@ -20,7 +20,10 @@
     helper: "{{ playbook_dir }}/fw-helper"
     work: "{{ lookup('env', 'FW_WORK_DIR') | default('/tmp', true) }}"
     pf_file: "{{ work }}/pf.conf"
+    net_file: "{{ work }}/network.conf"
     dhcp_file: "{{ repo }}/dhcp/dhcpd.conf"
+    # What a firewall with no network files from here reports.
+    no_network: "sha256:{{ '# openbsd-gitops network\n' | hash('sha256') }}"
 
   environment:
     FW_HOST: "{{ settings.host }}"
@@ -42,6 +45,18 @@
         checksum_algorithm: sha256
       register: pf_stat
 
+    - name: Join the network files into one
+      ansible.builtin.shell: python3 -m fwgitops assemble-network > {{ net_file | quote }}
+      args:
+        chdir: "{{ repo }}"
+      changed_when: false
+
+    - name: Work out the digest of the network files to deploy
+      ansible.builtin.stat:
+        path: "{{ net_file }}"
+        checksum_algorithm: sha256
+      register: net_stat
+
     - name: Ask the firewall what it is running
       ansible.builtin.command: "{{ helper }} status"
       register: status_before
@@ -50,7 +65,18 @@
     - name: Read the firewall's answer
       ansible.builtin.set_fact:
         wanted: "sha256:{{ pf_stat.stat.checksum }}"
+        wanted_net: "sha256:{{ net_stat.stat.checksum }}"
         before: "{{ dict(status_before.stdout_lines | select('search', '=') | map('split', '=', 1)) }}"
+
+    # A helper from before network support says nothing about the network.
+    - name: Note whether the network files have changed
+      ansible.builtin.set_fact:
+        net_changed: "{{ before.net_sha256 | default(no_network) != wanted_net }}"
+
+    - name: Stop if the firewall's helper is too old for network files
+      ansible.builtin.assert:
+        that: before.net_sha256 is defined or not (net_changed | bool)
+        fail_msg: The helper installed on the firewall does not support network files. Reinstall target/fcc-pfctl.
 
     - name: Stop if PF is switched off
       ansible.builtin.assert:
@@ -62,18 +88,34 @@
         that: before.armed == '0'
         fail_msg: A rollback from an earlier deployment is still pending on the firewall. Try again after its grace period.
 
-    - name: Deploy the rules
-      when: before.committed_sha256 != wanted or before.loaded_sha256 != wanted
+    - name: Deploy the rules and the network files
+      when: (net_changed | bool) or before.committed_sha256 != wanted or before.loaded_sha256 != wanted
       block:
+        # Rules may name an interface that the network files are about to
+        # create, so with a network change they are checked after it instead.
         - name: Have the firewall check the rules without loading them
           ansible.builtin.shell: "{{ helper | quote }} validate < {{ pf_file | quote }}"
           register: validated
           changed_when: false
+          when: not (net_changed | bool)
 
         - name: Confirm the firewall received exactly these rules
           ansible.builtin.assert:
             that: validated.stdout is search(wanted)
             fail_msg: The firewall received different bytes than were sent.
+          when: not (net_changed | bool)
+
+        - name: Have the firewall check the network files without installing them
+          ansible.builtin.shell: "{{ helper | quote }} net-validate < {{ net_file | quote }}"
+          register: net_validated
+          changed_when: false
+          when: net_changed | bool
+
+        - name: Confirm the firewall received exactly these network files
+          ansible.builtin.assert:
+            that: net_validated.stdout is search(wanted_net)
+            fail_msg: The firewall received different bytes than were sent.
+          when: net_changed | bool
 
         - name: Keep a copy of the current rules on the firewall
           ansible.builtin.command: "{{ helper }} backup"
@@ -82,33 +124,43 @@
           ansible.builtin.command: "{{ helper }} arm {{ grace }}"
           register: armed
 
-        - name: Note that rules are about to be loaded
+        - name: Note that the firewall is about to be changed
           ansible.builtin.file:
             path: "{{ work }}/rules-were-loaded"
             state: touch
             mode: "0600"
 
+        - name: Install the network files and bring the network up
+          ansible.builtin.shell: "{{ helper | quote }} net-apply < {{ net_file | quote }}"
+          when: net_changed | bool
+
+        # Also when only the network changed: rules that use an interface's
+        # address are worked out again from the new one.
         - name: Load the new rules into the running firewall
           ansible.builtin.shell: "{{ helper | quote }} apply < {{ pf_file | quote }}"
 
-        - name: Reconnect to prove the new rules still let us in
+        - name: Reconnect to prove the firewall still lets us in
           ansible.builtin.command: "{{ helper }} status"
           register: status_applied
           changed_when: false
 
-        - name: Confirm the firewall is running the new rules
+        - name: Confirm the firewall is running the new rules and network files
           ansible.builtin.assert:
-            that: status_applied.stdout is search('loaded_sha256=' + wanted)
-            fail_msg: The firewall is not running the rules that were sent.
+            that:
+              - status_applied.stdout is search('loaded_sha256=' + wanted)
+              - not (net_changed | bool) or status_applied.stdout is search('net_sha256=' + wanted_net)
+            fail_msg: The firewall is not running what was sent.
 
-        - name: Save the new rules as the firewall's permanent configuration
+        - name: Keep the new rules and network files for good
           ansible.builtin.command: "{{ helper }} commit"
 
-        - name: Confirm the firewall saved them
+        - name: Confirm the firewall kept them
           ansible.builtin.command: "{{ helper }} status"
           register: status_after
           changed_when: false
-          failed_when: status_after.stdout is not search('committed_sha256=' + wanted)
+          failed_when: >-
+            status_after.stdout is not search('committed_sha256=' + wanted)
+            or status_after.stdout is search('net_pending=1')
 
       rescue:
         - name: Undo the change
@@ -132,12 +184,13 @@
           ansible.builtin.fail:
             msg: >-
               The deployment failed at "{{ ansible_failed_task.name }}".
+              {{ ansible_failed_result.stderr | default('', true) }}
               {% if status_recovered is failed %}
               The firewall cannot be reached, so what it is running is UNCONFIRMED. Check it at its console.
-              {% elif status_recovered.stdout is search('armed=0') and status_recovered.stdout is search('loaded_sha256=' + before.committed_sha256) %}
-              The firewall is back on its previous rules.
+              {% elif status_recovered.stdout is search('armed=0') and status_recovered.stdout is search('loaded_sha256=' + before.committed_sha256) and status_recovered.stdout is search('net_sha256=' + before.net_sha256 | default('')) %}
+              The firewall is back on its previous rules and network files.
               {% else %}
-              The firewall answered but is not on its previous rules. Check it.
+              The firewall answered but is not on its previous rules and network files. Check it.
               {% endif %}
 
     - name: Check whether there is a DHCP configuration to deploy
@@ -147,22 +200,34 @@
       failed_when: false
 
     - name: Deploy the DHCP configuration
-      when: dhcp_active.rc == 0
       block:
         - name: Work out the digest of the DHCP configuration
           ansible.builtin.stat:
             path: "{{ dhcp_file }}"
             checksum_algorithm: sha256
           register: dhcp_stat
+          when: dhcp_active.rc == 0
 
         - name: Stop if the firewall's helper is too old for DHCP
           ansible.builtin.assert:
             that: before.dhcpd_sha256 is defined
             fail_msg: The helper installed on the firewall does not support DHCP. Reinstall target/fcc-pfctl.
+          when: dhcp_active.rc == 0
 
-        - name: Install the DHCP configuration and restart dhcpd
+        # Also when the file is the same but dhcpd is not running, or the
+        # network changed: dhcpd only sees the interfaces it started with.
+        - name: Install the DHCP configuration and start dhcpd
           ansible.builtin.shell: "{{ helper | quote }} dhcpd-apply < {{ dhcp_file | quote }}"
-          when: before.dhcpd_sha256 != 'sha256:' + dhcp_stat.stat.checksum
+          when: >-
+            dhcp_active.rc == 0 and
+            (before.dhcpd_sha256 != 'sha256:' + dhcp_stat.stat.checksum
+            or before.dhcpd | default('running') != 'running'
+            or (net_changed | bool))
+
+        # Only a configuration that came from here is ever taken away.
+        - name: Remove the DHCP configuration and stop dhcpd
+          ansible.builtin.command: "{{ helper }} dhcpd-remove"
+          when: dhcp_active.rc != 0 and before.dhcpd_managed | default('0') == '1'
 
       rescue:
         # The deployer reads this to tell a DHCP failure, which it retries,

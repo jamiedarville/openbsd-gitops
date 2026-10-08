@@ -88,7 +88,8 @@ while :; do
 			[ "$commit" = "$tried" ] || log "deploying $commit: $(git -C "$CHECKOUT" log -1 --format=%s "origin/$BRANCH")"
 			git -C "$CHECKOUT" reset --quiet --hard "origin/$BRANCH"
 			# The firewall's playbook creates the first file just before it
-			# loads rules, and the second if only the DHCP configuration fails.
+			# changes the rules or the network, and the second if only the
+			# DHCP configuration fails.
 			rm -f "$STATE/rules-were-loaded" "$STATE/dhcp-failed"
 			if ansible-playbook -i localhost, "$CHECKOUT/$PLAYBOOK" >"$STATE/last-deploy.log" 2>&1; then
 				if grep -q 'changed=[1-9]' "$STATE/last-deploy.log"; then
@@ -103,15 +104,16 @@ while :; do
 				}
 				record "$commit" retrying
 			elif [ -f "$STATE/dhcp-failed" ]; then
-				# The rules are live and saved; only the DHCP configuration is
-				# not. Installing it cannot lock anyone out, so keep trying.
+				# The rules and the network are live and saved; only the DHCP
+				# configuration is not. Installing it cannot lock anyone out,
+				# so keep trying.
 				[ "$commit" = "$tried" ] || {
-					log "the rules of $commit are deployed, but its DHCP configuration could not be installed. Retrying every $INTERVAL seconds."
+					log "the rules and network of $commit are deployed, but its DHCP configuration could not be installed. Retrying every $INTERVAL seconds."
 					sed -n '/Report the failed DHCP deployment/,$p' "$STATE/last-deploy.log" | grep -m1 '"msg"' || true
 				}
 				record "$commit" retrying
 			elif [ -f "$STATE/rules-were-loaded" ]; then
-				log "DEPLOYMENT OF $commit FAILED after its rules were loaded; it will not be retried. Push a fix or a revert."
+				log "DEPLOYMENT OF $commit FAILED after the firewall was changed; it will not be retried. Push a fix or a revert."
 				sed -n '/Report the failed deployment/,$p' "$STATE/last-deploy.log" | grep -m1 '"msg"' || true
 				echo "$commit" >"$STATE/failed"
 				record "$commit" failed

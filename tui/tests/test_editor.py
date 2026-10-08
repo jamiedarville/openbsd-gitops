@@ -101,7 +101,7 @@ class EditorTests(unittest.TestCase):
         editor = Editor(self.root)
         editor.wait_for("Save and deploy")
 
-        editor.press(ENTER)  # open "Firewall rules"
+        editor.press(DOWN, ENTER)  # open "Firewall rules"
         editor.press(ENTER)  # "Create rule"
         editor.press(ENTER)  # pass
         editor.press(ENTER)  # in
@@ -125,7 +125,7 @@ class EditorTests(unittest.TestCase):
         editor = Editor(self.root)
         editor.wait_for("Save and deploy")
 
-        editor.press(ENTER, DOWN, ENTER)  # Firewall rules, "View and change rules"
+        editor.press(DOWN, ENTER, DOWN, ENTER)  # Firewall rules, "View and change rules"
         editor.press(b"a")  # add
         editor.press(DOWN, ENTER)  # block
         editor.press(ENTER)  # in
@@ -143,7 +143,7 @@ class EditorTests(unittest.TestCase):
     def test_rejects_a_bad_answer_and_asks_again(self):
         editor = Editor(self.root)
         editor.wait_for("Save and deploy")
-        editor.press(ENTER, ENTER, ENTER, ENTER)  # Firewall rules, "Create rule", pass, in
+        editor.press(DOWN, ENTER, ENTER, ENTER, ENTER)  # Firewall rules, "Create rule", pass, in
         screen = editor.press(b"em0; pass all", ENTER)
         self.assertIn("An interface looks like", screen)
         editor.press(ESCAPE, ESCAPE, ESCAPE)
@@ -153,12 +153,52 @@ class EditorTests(unittest.TestCase):
     def test_moves_and_deletes_lines(self):
         editor = Editor(self.root)
         editor.wait_for("Save and deploy")
-        editor.press(ENTER, DOWN, ENTER)  # Firewall rules, "View and change rules"; first line selected
+        editor.press(DOWN, ENTER, DOWN, ENTER)  # Firewall rules, "View and change rules"; first line selected
         editor.press(b"n")  # move "block all" down
         self.assertEqual(self.rules(), ["pass in proto tcp from any to any port 22", "block all"])
         editor.press(b"d", DOWN, ENTER)  # delete it: move to "Yes", confirm
         self.assertEqual(self.rules(), ["pass in proto tcp from any to any port 22"])
         editor.press(ESCAPE, ESCAPE)
+        self.assertEqual(editor.close(), 0)
+
+    def test_adds_a_vlan_with_everything_behind_it(self):
+        editor = Editor(self.root)
+        editor.wait_for("Save and deploy")
+
+        editor.press(ENTER, ENTER)  # Networks, "Add a VLAN"
+        editor.press(b"em1", ENTER)  # the port that carries it
+        editor.press(b"10", ENTER)  # VLAN number
+        editor.press(b"192.168.10.1/24", ENTER)  # the firewall's address
+        editor.press(b"Office", ENTER)
+        editor.press(DOWN, ENTER)  # DHCP: Yes
+        editor.press(ENTER)  # keep the suggested DNS servers
+        screen = editor.press(DOWN, ENTER)  # reach the internet: Yes
+
+        self.assertIn("VLAN 10 is written", screen)
+        read = lambda name: (self.root / name).read_text().splitlines()
+        self.assertEqual(
+            read("network/hostname.vlan10"),
+            ["# Office", "parent em1 vnetid 10", "inet 192.168.10.1 255.255.255.0", "up"],
+        )
+        self.assertEqual(read("network/hostname.em1"), ["up"])
+        self.assertEqual(read("network/sysctl.conf"), ["net.inet.ip.forwarding=1"])
+        self.assertEqual(
+            read("dhcp/dhcpd.conf"),
+            [
+                "subnet 192.168.10.0 netmask 255.255.255.0 { range 192.168.10.100 192.168.10.200; "
+                "option routers 192.168.10.1; option domain-name-servers 1.1.1.1, 9.9.9.9; }"
+            ],
+        )
+        self.assertEqual(
+            read("nat/20-nat.conf"), ["match out on egress inet from (vlan10:network) to any nat-to (egress)  # Office"]
+        )
+        self.assertEqual(self.rules()[-1], "pass in on vlan10 from (vlan10:network) to any  # Office")
+        editor.press(ENTER)  # close the summary
+        # The list behind it now offers the new files. curses redraws only what
+        # differs from the summary, so only whole new lines can be looked for.
+        self.assertIn("Change hostname.em1", editor.read())
+        self.assertIn("Routing between networks: on", editor.read())
+        editor.press(ESCAPE)
         self.assertEqual(editor.close(), 0)
 
     def test_saves_changes_as_a_commit(self):
@@ -170,7 +210,7 @@ class EditorTests(unittest.TestCase):
         editor = Editor(self.root)
         editor.wait_for("Save and deploy")
 
-        editor.press(DOWN, DOWN, DOWN, DOWN, DOWN, ENTER)  # "Save and deploy"
+        editor.press(*[DOWN] * 7, ENTER)  # "Save and deploy"
         editor.press(ENTER)  # close the diff
         editor.press(ENTER)  # check on the firewall first: No
         screen = editor.press(b"Allow outbound", ENTER)
@@ -186,7 +226,7 @@ class EditorTests(unittest.TestCase):
         editor = Editor(self.root)
         editor.wait_for("Save and deploy")
 
-        editor.press(DOWN, DOWN, DOWN, DOWN, DOWN, ENTER)  # "Save and deploy"
+        editor.press(*[DOWN] * 7, ENTER)  # "Save and deploy"
         screen = editor.press(ENTER)  # close the diff
 
         self.assertIn("no rule seems to allow SSH", screen)

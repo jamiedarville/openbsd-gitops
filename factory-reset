@@ -77,6 +77,8 @@ if [ "$what" = firewall ]; then
 	echo "    They pass everything and do no NAT: networks behind the firewall lose their"
 	echo "    way out, and nothing is filtered any more"
 	echo "  - remove /etc/dhcpd.conf, and stop and disable dhcpd"
+	echo "  - leave the network as it is: the interface files, /etc/sysctl.conf and"
+	echo "    /etc/mygate stay, so the machine keeps the addresses it is reached on"
 else
 	echo "  - remove the fccmon account, its key and its sudo rule"
 	echo "  - remove the monitoring stack and all its data, with /opt/monitoring"
