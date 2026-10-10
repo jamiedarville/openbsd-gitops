@@ -1,0 +1,409 @@
+<?xml version="1.0"?>
+<!-- A made-up OPNsense backup, used by test_opnsense.py and by test/run. Its
+     ports are vtnet0 and vtnet1, which OpenBSD calls vio0 and vio1: the ports
+     of the test firewall. -->
+<opnsense>
+  <version>24.7</version>
+  <system>
+    <hostname>gate</hostname>
+    <domain>home.arpa</domain>
+    <dnsserver>9.9.9.9</dnsserver>
+    <dnsserver>1.1.1.1</dnsserver>
+    <user>
+      <name>root</name>
+      <password>$2y$10$NotARealHashNotARealHashNotARealHashNotARealHashNotAR</password>
+    </user>
+  </system>
+  <interfaces>
+    <wan>
+      <if>vtnet0</if>
+      <descr>WAN</descr>
+      <enable>1</enable>
+      <ipaddr>dhcp</ipaddr>
+      <ipaddrv6>dhcp6</ipaddrv6>
+      <blockbogons>1</blockbogons>
+    </wan>
+    <lan>
+      <if>vtnet1</if>
+      <descr>LAN</descr>
+      <enable>1</enable>
+      <ipaddr>192.168.1.1</ipaddr>
+      <subnet>24</subnet>
+    </lan>
+    <opt1>
+      <if>vlan0.10</if>
+      <descr>IOT</descr>
+      <enable>1</enable>
+      <ipaddr>192.168.10.1</ipaddr>
+      <subnet>24</subnet>
+    </opt1>
+    <opt2>
+      <if>vlan0.20</if>
+      <descr>GUEST</descr>
+      <enable>1</enable>
+      <ipaddr>192.168.20.1</ipaddr>
+      <subnet>24</subnet>
+    </opt2>
+    <opt3>
+      <if>wg0</if>
+      <descr>VPN</descr>
+      <enable>1</enable>
+    </opt3>
+    <lo0>
+      <internal_dynamic>1</internal_dynamic>
+      <descr>Loopback</descr>
+      <enable>1</enable>
+      <if>lo0</if>
+      <ipaddr>127.0.0.1</ipaddr>
+      <subnet>8</subnet>
+      <virtual>1</virtual>
+    </lo0>
+  </interfaces>
+  <vlans>
+    <vlan uuid="6a1f0a52-0000-4000-8000-000000000010">
+      <if>vtnet1</if>
+      <tag>10</tag>
+      <pcp>0</pcp>
+      <descr>iot</descr>
+      <vlanif>vlan0.10</vlanif>
+    </vlan>
+    <vlan uuid="6a1f0a52-0000-4000-8000-000000000020">
+      <if>vtnet1</if>
+      <tag>20</tag>
+      <pcp>0</pcp>
+      <descr>guest</descr>
+      <vlanif>vlan0.20</vlanif>
+    </vlan>
+    <vlan uuid="6a1f0a52-0000-4000-8000-000000000030">
+      <if>vtnet1</if>
+      <tag>30</tag>
+      <vlanif>vlan0.30</vlanif>
+    </vlan>
+  </vlans>
+  <ifgroups>
+    <ifgroupentry>
+      <ifname>inside</ifname>
+      <members>lan opt1</members>
+    </ifgroupentry>
+  </ifgroups>
+  <staticroutes>
+    <route>
+      <network>10.50.0.0/16</network>
+      <gateway>LAB_GW</gateway>
+    </route>
+  </staticroutes>
+  <gateways>
+    <gateway_item>
+      <interface>lan</interface>
+      <gateway>192.168.1.254</gateway>
+      <name>LAB_GW</name>
+      <ipprotocol>inet</ipprotocol>
+    </gateway_item>
+  </gateways>
+  <OPNsense>
+    <Firewall>
+      <Alias>
+        <aliases>
+          <alias uuid="0c0c0c0c-0000-4000-8000-000000000001">
+            <enabled>1</enabled>
+            <name>servers</name>
+            <type>host</type>
+            <content>192.168.1.10
+192.168.1.11
+nas.example.net</content>
+            <description>Machines that serve</description>
+          </alias>
+          <alias uuid="0c0c0c0c-0000-4000-8000-000000000002">
+            <enabled>1</enabled>
+            <name>rfc1918</name>
+            <type>network</type>
+            <content>10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16</content>
+            <description>Private networks</description>
+          </alias>
+          <alias uuid="0c0c0c0c-0000-4000-8000-000000000003">
+            <enabled>1</enabled>
+            <name>web</name>
+            <type>port</type>
+            <content>80
+443
+8000:8010</content>
+            <description>Web ports</description>
+          </alias>
+          <alias uuid="0c0c0c0c-0000-4000-8000-000000000004">
+            <enabled>1</enabled>
+            <name>badcountries</name>
+            <type>geoip</type>
+            <content>XX</content>
+          </alias>
+        </aliases>
+      </Alias>
+    </Firewall>
+    <unboundplus>
+      <general>
+        <enabled>1</enabled>
+        <port>53</port>
+        <dnssec>1</dnssec>
+        <regdhcpstatic>1</regdhcpstatic>
+        <active_interface/>
+      </general>
+      <hosts>
+        <host uuid="0d0d0d0d-0000-4000-8000-000000000001">
+          <enabled>1</enabled>
+          <hostname>nas</hostname>
+          <domain>home.arpa</domain>
+          <rr>A</rr>
+          <server>192.168.1.10</server>
+          <description>The file server</description>
+        </host>
+        <host uuid="0d0d0d0d-0000-4000-8000-000000000002">
+          <enabled>0</enabled>
+          <hostname>old</hostname>
+          <domain>home.arpa</domain>
+          <rr>A</rr>
+          <server>192.168.1.99</server>
+        </host>
+      </hosts>
+      <aliases>
+        <alias uuid="0d0d0d0d-0000-4000-8000-000000000003">
+          <enabled>1</enabled>
+          <host>0d0d0d0d-0000-4000-8000-000000000001</host>
+          <hostname>files</hostname>
+          <domain>home.arpa</domain>
+        </alias>
+      </aliases>
+      <domains>
+        <domain uuid="0d0d0d0d-0000-4000-8000-000000000004">
+          <enabled>1</enabled>
+          <domain>corp.example</domain>
+          <server>192.168.1.53</server>
+        </domain>
+      </domains>
+      <dots>
+        <dot uuid="0d0d0d0d-0000-4000-8000-000000000005">
+          <enabled>1</enabled>
+          <type>dot</type>
+          <domain/>
+          <server>9.9.9.9</server>
+          <port>853</port>
+          <verify>dns.quad9.net</verify>
+        </dot>
+      </dots>
+    </unboundplus>
+  </OPNsense>
+  <dhcpd>
+    <lan>
+      <enable>1</enable>
+      <range>
+        <from>192.168.1.100</from>
+        <to>192.168.1.199</to>
+      </range>
+      <defaultleasetime>3600</defaultleasetime>
+      <staticmap>
+        <mac>00:11:22:33:44:55</mac>
+        <ipaddr>192.168.1.10</ipaddr>
+        <hostname>nas</hostname>
+      </staticmap>
+      <staticmap>
+        <mac>00:11:22:33:44:66</mac>
+        <hostname>roaming</hostname>
+      </staticmap>
+    </lan>
+    <opt1>
+      <enable>1</enable>
+      <range>
+        <from>192.168.10.100</from>
+        <to>192.168.10.200</to>
+      </range>
+      <dnsserver>9.9.9.9</dnsserver>
+      <staticmap>
+        <mac>AA:BB:CC:00:00:01</mac>
+        <ipaddr>192.168.10.50</ipaddr>
+        <hostname>camera</hostname>
+      </staticmap>
+    </opt1>
+    <opt2>
+      <enable>1</enable>
+      <range>
+        <from>192.168.20.100</from>
+        <to>192.168.20.200</to>
+      </range>
+    </opt2>
+  </dhcpd>
+  <nat>
+    <outbound>
+      <mode>hybrid</mode>
+      <rule>
+        <source>
+          <network>192.168.10.0/24</network>
+        </source>
+        <destination>
+          <any>1</any>
+        </destination>
+        <interface>wan</interface>
+        <protocol>udp</protocol>
+        <dstport>123</dstport>
+        <staticnatport>1</staticnatport>
+        <descr>NTP keeps its port</descr>
+      </rule>
+    </outbound>
+    <rule>
+      <protocol>tcp</protocol>
+      <interface>wan</interface>
+      <ipprotocol>inet</ipprotocol>
+      <target>192.168.1.10</target>
+      <local-port>8443</local-port>
+      <source>
+        <any>1</any>
+      </source>
+      <destination>
+        <network>wanip</network>
+        <port>443</port>
+      </destination>
+      <descr>HTTPS to the file server</descr>
+      <associated-rule-id>nat_5f00000000000.00000001</associated-rule-id>
+    </rule>
+  </nat>
+  <filter>
+    <rule>
+      <type>pass</type>
+      <interface>wan</interface>
+      <ipprotocol>inet</ipprotocol>
+      <protocol>tcp</protocol>
+      <source>
+        <any>1</any>
+      </source>
+      <destination>
+        <address>192.168.1.10</address>
+        <port>8443</port>
+      </destination>
+      <descr>HTTPS to the file server</descr>
+      <associated-rule-id>nat_5f00000000000.00000001</associated-rule-id>
+    </rule>
+    <rule>
+      <type>pass</type>
+      <interface>lan</interface>
+      <ipprotocol>inet</ipprotocol>
+      <source>
+        <network>lan</network>
+      </source>
+      <destination>
+        <any>1</any>
+      </destination>
+      <descr>Default allow LAN to any rule</descr>
+    </rule>
+    <rule>
+      <type>pass</type>
+      <interface>opt1</interface>
+      <ipprotocol>inet</ipprotocol>
+      <protocol>tcp/udp</protocol>
+      <source>
+        <network>opt1</network>
+      </source>
+      <destination>
+        <network>opt1ip</network>
+        <port>53</port>
+      </destination>
+      <descr>IOT may ask the firewall for names</descr>
+    </rule>
+    <rule>
+      <type>block</type>
+      <interface>opt1</interface>
+      <ipprotocol>inet</ipprotocol>
+      <source>
+        <network>opt1</network>
+      </source>
+      <destination>
+        <address>rfc1918</address>
+      </destination>
+      <log>1</log>
+      <descr>IOT may not reach inside</descr>
+    </rule>
+    <rule>
+      <type>pass</type>
+      <interface>opt1</interface>
+      <ipprotocol>inet</ipprotocol>
+      <protocol>tcp</protocol>
+      <source>
+        <network>opt1</network>
+      </source>
+      <destination>
+        <any>1</any>
+        <port>web</port>
+      </destination>
+      <descr>IOT may browse</descr>
+    </rule>
+    <rule>
+      <type>pass</type>
+      <interface>opt2</interface>
+      <ipprotocol>inet</ipprotocol>
+      <source>
+        <network>opt2</network>
+      </source>
+      <destination>
+        <network>opt1</network>
+        <not>1</not>
+      </destination>
+      <descr>Guests go anywhere but IOT</descr>
+    </rule>
+    <rule>
+      <type>pass</type>
+      <interface>opt2</interface>
+      <ipprotocol>inet</ipprotocol>
+      <protocol>tcp</protocol>
+      <source>
+        <network>opt2</network>
+      </source>
+      <destination>
+        <address>servers</address>
+        <port>22</port>
+      </destination>
+      <disabled>1</disabled>
+      <descr>Guests to SSH, switched off</descr>
+    </rule>
+    <rule>
+      <type>reject</type>
+      <interface>opt3</interface>
+      <source>
+        <any>1</any>
+      </source>
+      <destination>
+        <any>1</any>
+      </destination>
+      <descr>Nothing in from the VPN</descr>
+    </rule>
+    <rule>
+      <type>pass</type>
+      <interface>inside</interface>
+      <ipprotocol>inet</ipprotocol>
+      <protocol>icmp</protocol>
+      <icmptype>echoreq</icmptype>
+      <source>
+        <any>1</any>
+      </source>
+      <destination>
+        <network>(self)</network>
+      </destination>
+      <descr>Ping the firewall</descr>
+    </rule>
+    <rule>
+      <type>block</type>
+      <interface>wan,opt2</interface>
+      <ipprotocol>inet46</ipprotocol>
+      <floating>yes</floating>
+      <quick>1</quick>
+      <direction>in</direction>
+      <protocol>tcp</protocol>
+      <source>
+        <address>badcountries</address>
+      </source>
+      <destination>
+        <any>1</any>
+        <port>25</port>
+      </destination>
+      <sched>worktime</sched>
+      <descr>No mail in</descr>
+    </rule>
+  </filter>
+</opnsense>

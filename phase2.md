@@ -13,7 +13,7 @@ and the order to build it in.
 | 1. Interfaces, VLANs and routing | Done, and proven by `test/run`. |
 | 2. NAT and a rule set that routes | Partly. See below. |
 | 3. DHCP that can be switched on and off | Done, and proven by `test/run`. |
-| 4. DNS for clients | Not started. |
+| 4. DNS for clients | Partly: `dns/unbound.conf` is deployed and proven by `test/run`. The DHCP form does not offer "this firewall" yet, and no default rule opens port 53. |
 | 5. Seeing what the firewall does | Not started. |
 
 The MVP below works end to end on OpenBSD 7.9: `test/run` deploys two VLANs

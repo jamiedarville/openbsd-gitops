@@ -6,7 +6,7 @@
 # It puts both machines back to a clean install, sets the firewall up with
 # ./setup from a copy of this folder, and deploys to it the way the deployer
 # does. It then breaks things on purpose, including locking itself out and
-# cutting the power halfway, and checks that the firewall recovers. About five
+# cutting the power halfway, and checks that the firewall recovers. Under ten
 # minutes. Build the machines first: test/vm build
 set -u
 
@@ -42,7 +42,7 @@ helper() {
 }
 # One pass of the deployer.
 deploy() {
-	rm -f "$tmp/state/rules-were-loaded" "$tmp/state/dhcp-failed"
+	rm -f "$tmp/state/rules-were-loaded" "$tmp/state/dhcp-failed" "$tmp/state/dns-failed"
 	(cd "$work" && FW_SSH_KEY=$tmp/keys/id_ed25519 FW_KNOWN_HOSTS=$tmp/keys/known_hosts \
 		FW_WORK_DIR=$tmp/state ANSIBLE_NOCOLOR=1 ANSIBLE_LOCAL_TEMP=$tmp/state/ansible \
 		ansible-playbook -i localhost, deploy/playbook.yml >"$tmp/state/deploy.log" 2>&1)
@@ -85,6 +85,10 @@ other_command() {
 try_network() {
 	./fw assemble-network | helper net-apply
 }
+refused_resolver() {
+	# A resolver configuration the helper must turn down.
+	! printf '%b' "$1" | helper unbound-apply
+}
 refused() {
 	# A network configuration the helper must turn down.
 	! printf '# openbsd-gitops network\n%b' "$1" | helper net-validate
@@ -121,6 +125,10 @@ check "a kernel setting outside the list" refused '# --- sysctl.conf ---\nkern.s
 check "a command in mygate" refused '# --- mygate ---\n!reboot\n'
 check "a file outside /etc" refused '# --- ../tmp/x ---\nup\n'
 check "network files without an armed watchdog" fails try_network
+check "a resolver that reads another file" refused_resolver 'server:\n\tinclude: "/etc/master.passwd"\n'
+check "a resolver that leaves its cage" refused_resolver 'server:\n\tchroot: ""\n\tusername: ""\n'
+check "a resolver that opens a control channel" refused_resolver 'remote-control:\n\tcontrol-enable: yes\n'
+check "a resolver that writes where it likes" refused_resolver 'server:\n\tauto-trust-anchor-file: "/etc/pf.conf"\n'
 
 step "Two VLANs, routing, NAT and DHCP"
 cd "$work" || exit 1
@@ -192,21 +200,63 @@ check "dhcpd came back by itself" said dhcpd=running helper status
 printf 'parent vio1 vnetid 10\ninet 192.168.10.1 255.255.255.0\nup\n' >network/hostname.vlan10
 check "the next pass finds nothing to do" nothing_to_do
 
+step "An OPNsense backup"
+# The backup's ports are vtnet0 and vtnet1, which the import turns into this
+# firewall's vio0 and vio1. Its VLANs are the two above, so the files written
+# by hand for them make way: that is what --force is for.
+cp "$here/dhcp/dhcpd.conf" dhcp/dhcpd.conf
+cp "$here/nat/20-nat.conf" nat/20-nat.conf
+cp "$here/firewall/30-rules.conf" firewall/30-rules.conf
+check "an import leaves files written by hand alone" fails ./fw import-opnsense tui/tests/opnsense-config.xml
+check "the import runs" ./fw import-opnsense --force tui/tests/opnsense-config.xml
+check "the firewall accepts the files" ./fw check
+check "the deployment succeeds" deploy
+check "the firewall runs what this folder holds" in_sync
+check "a second pass changes nothing" nothing_to_do
+check "dhcpd is running" said dhcpd=running helper status
+check "unbound is running" said unbound=running helper status
+check "the inside port has its address" said 192.168.1.1 firewall ifconfig vio1
+client 'doas sh -c "for n in 10 20; do ifconfig vlan\$n -autoconf; ifconfig vlan\$n inet autoconf; done"; sleep 10' >/dev/null 2>&1
+check "the client gets an address on IOT" said 'inet 192.168.10.' client ifconfig vlan10
+check "the client gets an address on GUEST" said 'inet 192.168.20.' client ifconfig vlan20
+check "IOT may browse" client route -T1 exec nc -zw5 1.1.1.1 443
+check "IOT may not reach another inside network" said 'timed out' client route -T1 exec nc -zvw4 192.168.20.1 8080
+check "guests reach the internet" client route -T2 exec nc -zw5 1.1.1.1 443
+check "guests may not reach IOT" said 'timed out' client route -T2 exec nc -zvw4 192.168.10.1 8080
+check "the resolver knows a host override" said 192.168.1.10 client route -T1 exec host nas.home.arpa 192.168.10.1
+check "and its alias, asked from another network" said 192.168.1.10 client route -T2 exec host files.home.arpa 192.168.20.1
+check "and a fixed DHCP address" said 192.168.10.50 client route -T1 exec host camera.home.arpa 192.168.10.1
+check "and the name behind an address" said nas.home.arpa client route -T1 exec host 192.168.1.10 192.168.10.1
+check "importing again changes nothing" sh -c './fw import-opnsense tui/tests/opnsense-config.xml >/dev/null && ./fw status'
+
 step "Taking things away again"
 cp "$here/dhcp/dhcpd.conf" dhcp/dhcpd.conf
 rm network/hostname.vlan20
-sed -i '/vlan20/d' nat/20-nat.conf firewall/30-rules.conf
+# The resolver stays, without the address that is about to go.
+sed -i '/192\.168\.20\./d' dns/unbound.conf
 check "the deployment succeeds" deploy
 check "the firewall runs what this folder holds" in_sync
 check "VLAN 20 is gone" fails firewall 'ifconfig vlan20 || ls /etc/hostname.vlan20'
 check "VLAN 10 is untouched" said 192.168.10.1 firewall ifconfig vlan10
 check "dhcpd is stopped" said dhcpd=stopped helper status
 check "its configuration is gone" said dhcpd_sha256=none helper status
+check "unbound is running without that address" said 192.168.1.10 client route -T1 exec host nas.home.arpa 192.168.10.1
+
+step "Without a resolver, and with one again"
+cp dns/unbound.conf "$tmp/unbound.conf"
+cp "$here/dns/unbound.conf" dns/unbound.conf
+check "the deployment succeeds" deploy
+check "unbound is stopped" said unbound=stopped helper status
+check "the configuration OpenBSD came with is back" firewall 'grep -q "^# \$OpenBSD" /var/unbound/etc/unbound.conf && ! ls /var/unbound/etc/unbound.conf.fcc-original'
+cp "$tmp/unbound.conf" dns/unbound.conf
+check "the deployment succeeds" deploy
+check "unbound is running" said unbound=running helper status
 
 step "Factory reset"
 check "./factory-reset runs" env PATH="$tmp/bin:$PATH" "$work/factory-reset" -y firewall fcc-firewall
 check "the helper and its hook are gone" fails firewall 'ls /usr/local/sbin/fcc-pfctl || ls /etc/rc.local || id fccdeploy'
 check "the firewall keeps its addresses" said 192.168.10.1 firewall ifconfig vlan10
+check "unbound is stopped, with the configuration OpenBSD came with" firewall '! rcctl check unbound && grep -q "^# \$OpenBSD" /var/unbound/etc/unbound.conf'
 
 echo
 if [ "$failures" -eq 0 ]; then

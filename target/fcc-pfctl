@@ -27,6 +27,15 @@ SHA256=/bin/sha256
 CONF=/etc/pf.conf
 DHCPD=/usr/sbin/dhcpd
 DHCPD_CONF=/etc/dhcpd.conf
+UNBOUND_CONF=/var/unbound/etc/unbound.conf
+UNBOUND_CHECK=/usr/sbin/unbound-checkconf
+UNBOUND_ANCHOR=/usr/sbin/unbound-anchor
+# The only files a deployed unbound.conf may name: the key DNSSEC is checked
+# against, and the certificates a forwarder over TLS is checked against.
+UNBOUND_KEY=/var/unbound/db/root.key
+UNBOUND_CERTS=/etc/ssl/cert.pem
+# The only other settings it may hold.
+UNBOUND_SETTINGS="interface access-control do-ip4 do-ip6 hide-identity hide-version prefetch qname-minimisation cache-min-ttl cache-max-ttl private-address private-domain domain-insecure local-zone local-data local-data-ptr name forward-addr forward-first forward-tls-upstream stub-addr"
 RCCTL=/usr/sbin/rcctl
 IFCONFIG=/sbin/ifconfig
 SYSCTL=/sbin/sysctl
@@ -117,6 +126,19 @@ record_loaded() {
 armed_token() {
 	[ -f "$RUN/armed" ] || return 1
 	cut -d' ' -f1 <"$RUN/armed"
+}
+
+# ----------------------------------------------------------------- resolver
+
+# True if a resolver configuration holds only what a resolver needs.
+# unbound.conf can also name files to read and write, the account to run as,
+# and code to load, which would make the deployment key more than it is. A
+# line must be a comment, the start of a section, or one of the settings
+# listed above with a value of plain characters.
+check_unbound() {
+	allowed=$(echo "$UNBOUND_SETTINGS" | sed 's/ /|/g')
+	tail='([[:blank:]]+#.*)?'
+	! LC_ALL=C grep -Evq "^[[:blank:]]*(#.*|(server|forward-zone|stub-zone):$tail|($allowed):[[:blank:]]+[A-Za-z0-9._:/@#\"*-]+([[:blank:]]+[A-Za-z0-9._:/@\"*-]+)*$tail|auto-trust-anchor-file:[[:blank:]]+\"$UNBOUND_KEY\"$tail|tls-cert-bundle:[[:blank:]]+\"$UNBOUND_CERTS\"$tail)?\$" "$1"
 }
 
 # ------------------------------------------------------------------ network
@@ -587,6 +609,21 @@ status)
 	else
 		echo "dhcpd=stopped"
 	fi
+	if [ -f "$UNBOUND_CONF" ]; then
+		echo "unbound_sha256=$(digest "$UNBOUND_CONF")"
+	else
+		echo "unbound_sha256=none"
+	fi
+	if [ -f "$STATE/unbound-managed" ]; then
+		echo "unbound_managed=1"
+	else
+		echo "unbound_managed=0"
+	fi
+	if "$RCCTL" check unbound >/dev/null 2>&1; then
+		echo "unbound=running"
+	else
+		echo "unbound=stopped"
+	fi
 	echo "net_sha256=$(network_digest)"
 	if [ -f "$STATE/net-pending" ]; then
 		echo "net_pending=1"
@@ -641,7 +678,72 @@ dhcpd-remove)
 	echo "dhcpd_sha256=none"
 	;;
 
+unbound-apply)
+	# Like DHCP, a resolver mistake cannot lock anyone out of the firewall,
+	# so there is no watchdog: the file is checked, then swapped in.
+	[ "$#" -eq 1 ] || fail 64 "unbound-apply takes no arguments"
+	candidate=$(read_candidate)
+	lock
+	if ! check_unbound "$candidate"; then
+		rm -f "$candidate"
+		fail 65 "unbound.conf: only sections, and these settings with plain values, are allowed: $UNBOUND_SETTINGS auto-trust-anchor-file tls-cert-bundle"
+	fi
+	# As /etc/rc.d/unbound does before a start: unbound turns down a
+	# configuration that names a key which is not there yet.
+	# unbound reads the key as its own account, so it is not made root-only
+	# as everything else here is.
+	if grep -q '^[[:blank:]]*auto-trust-anchor-file:' "$candidate" && [ ! -f "$UNBOUND_KEY" ]; then
+		(umask 022 && "$UNBOUND_ANCHOR" -a "$UNBOUND_KEY") >/dev/null 2>&1 || true
+	fi
+	if ! "$UNBOUND_CHECK" "$candidate" >&2; then
+		rm -f "$candidate"
+		fail 65 "unbound rejected the configuration"
+	fi
+	if [ -f "$UNBOUND_CONF" ]; then
+		# The configuration OpenBSD came with is kept, for unbound-remove
+		# to put back.
+		[ -f "$STATE/unbound-managed" ] || cp -p "$UNBOUND_CONF" "$UNBOUND_CONF.fcc-original"
+		cp -p "$UNBOUND_CONF" "$UNBOUND_CONF.fcc-previous"
+	fi
+	cp "$candidate" "$UNBOUND_CONF.fcc-new"
+	chmod 644 "$UNBOUND_CONF.fcc-new"
+	mv -f "$UNBOUND_CONF.fcc-new" "$UNBOUND_CONF"
+	rm -f "$candidate"
+	touch "$STATE/unbound-managed"
+	# unbound only listens on the addresses that exist when it starts, so it
+	# is always started afresh.
+	"$RCCTL" enable unbound
+	if "$RCCTL" check unbound >/dev/null 2>&1; then
+		"$RCCTL" restart unbound >/dev/null || fail 70 "unbound did not start; does an interface have each address it listens on?"
+		started=restarted
+	else
+		"$RCCTL" start unbound >/dev/null || fail 70 "unbound did not start; does an interface have each address it listens on?"
+		started=started
+	fi
+	# unbound reports a start and only then reads the rest of its
+	# configuration, so a start that did not last is caught here.
+	sleep 2
+	"$RCCTL" check unbound >/dev/null 2>&1 || fail 70 "unbound started and stopped again; see /var/log/daemon on the firewall"
+	echo "unbound=$started"
+	echo "unbound_sha256=$(digest "$UNBOUND_CONF")"
+	;;
+
+unbound-remove)
+	[ "$#" -eq 1 ] || fail 64 "unbound-remove takes no arguments"
+	lock
+	[ -f "$STATE/unbound-managed" ] || fail 69 "the resolver configuration on the firewall did not come from here"
+	if "$RCCTL" check unbound >/dev/null 2>&1; then
+		"$RCCTL" stop unbound >/dev/null
+	fi
+	"$RCCTL" disable unbound
+	if [ -f "$UNBOUND_CONF.fcc-original" ]; then
+		mv -f "$UNBOUND_CONF.fcc-original" "$UNBOUND_CONF"
+	fi
+	rm -f "$UNBOUND_CONF.fcc-previous" "$STATE/unbound-managed"
+	echo "unbound_sha256=$(digest "$UNBOUND_CONF")"
+	;;
+
 *)
-	fail 64 "usage: fcc-pfctl validate|backup|arm <seconds>|apply|commit|rollback|status|dhcpd-apply|dhcpd-remove|net-validate|net-apply|boot"
+	fail 64 "usage: fcc-pfctl validate|backup|arm <seconds>|apply|commit|rollback|status|dhcpd-apply|dhcpd-remove|unbound-apply|unbound-remove|net-validate|net-apply|boot"
 	;;
 esac

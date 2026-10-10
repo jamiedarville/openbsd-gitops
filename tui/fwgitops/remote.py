@@ -17,7 +17,7 @@ CONFIG_FILE = "firewall.json"
 # the deployment key and the firewall's pinned host key.
 LOCAL_FILE = ".fw-local.json"
 # The folders the editor commits.
-CONFIG_FOLDERS = ("firewall", "nat", "dhcp", "network")
+CONFIG_FOLDERS = ("firewall", "nat", "dhcp", "dns", "network")
 
 
 class RemoteError(RuntimeError):

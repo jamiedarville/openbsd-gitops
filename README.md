@@ -1,7 +1,7 @@
 # openbsd-gitops
 
 Configuration for an OpenBSD firewall and router, kept as plain text in Git:
-its PF rules, NAT, interfaces and VLANs, routing, and DHCP.
+its PF rules, NAT, interfaces and VLANs, routing, DHCP, and DNS resolver.
 
 - **The files in this repository are the configuration.** Read them, edit them
   by hand, or use the `./fw` editor to build rules for you.
@@ -22,6 +22,7 @@ its PF rules, NAT, interfaces and VLANs, routing, and DHCP.
 | `firewall/30-rules.conf`     | Filter rules.                                                                  |
 | `network/`                   | Interfaces, VLANs, routing and the default route. See Networks.                |
 | `dhcp/dhcpd.conf`            | DHCP server configuration. Ignored while it holds only comments.               |
+| `dns/unbound.conf`           | DNS resolver configuration. Ignored while it holds only comments. See DNS.     |
 | `firewall.json`              | Which firewall this repository is for.                                         |
 | `deploy/`                    | The Ansible playbook and the container that runs it.                           |
 | `target/fcc-pfctl`           | The helper installed on the firewall.                                          |
@@ -71,6 +72,7 @@ Without the menus:
 ./fw assemble-network   # print the network files exactly as they will be sent
 ./fw check              # have the firewall check both; changes nothing
 ./fw status             # compare this folder with the firewall
+./fw import-opnsense config.xml   # write these files from an OPNsense backup
 ```
 
 Undo a change with `git revert <commit>` and push.
@@ -127,6 +129,130 @@ Not handled yet: IPv6 addresses in `mygate`, interfaces other than ports and
 VLANs, and addresses added to a port as aliases, which stay until a restart
 when the file stops naming them.
 
+## DNS
+
+`dns/unbound.conf` is the configuration of Unbound, the resolver OpenBSD comes
+with, and is installed as `/var/unbound/etc/unbound.conf`. With a server in
+it, `unbound` is switched on and started, and started afresh whenever the file
+or the network files change. Emptying the file again stops `unbound`, switches
+it off, and puts back the configuration OpenBSD came with.
+
+```
+server:
+	interface: 127.0.0.1
+	interface: 192.168.10.1
+	access-control: 192.168.10.0/24 allow
+	local-data: "printer.home.arpa. IN A 192.168.10.50"
+	local-data-ptr: "192.168.10.50 printer.home.arpa."
+
+forward-zone:
+	name: "corp.example."
+	forward-addr: 192.168.10.53
+```
+
+Three things have to agree for a network to use it: an `interface:` line with
+the firewall's address on that network, a rule that lets the network reach
+port 53 there, and `option domain-name-servers` with that address in
+`dhcp/dhcpd.conf`.
+
+`unbound.conf` can also name files to read and write, the account to run as,
+and code to load, so the firewall accepts only what a resolver needs:
+
+- the sections `server:`, `forward-zone:` and `stub-zone:`;
+- the settings `interface`, `access-control`, `do-ip4`, `do-ip6`,
+  `hide-identity`, `hide-version`, `prefetch`, `qname-minimisation`,
+  `cache-min-ttl`, `cache-max-ttl`, `private-address`, `private-domain`,
+  `domain-insecure`, `local-zone`, `local-data`, `local-data-ptr`, `name`,
+  `forward-addr`, `forward-first`, `forward-tls-upstream` and `stub-addr`, with
+  values made of letters, digits, spaces and `. _ : / @ # " * -`;
+- `auto-trust-anchor-file: "/var/unbound/db/root.key"`, which switches DNSSEC
+  on, and `tls-cert-bundle: "/etc/ssl/cert.pem"`, for forwarding over TLS.
+  Neither may name another file.
+
+`./fw check` and `./fw status` do not look at the resolver or at DHCP; the
+deployment says so if the firewall turns either down.
+
+## Importing from OPNsense
+
+```sh
+./fw import-opnsense -n config.xml    # say what would be written
+./fw import-opnsense config.xml       # write it
+```
+
+`config.xml` is the backup OPNsense offers under System, Configuration,
+Backups, downloaded without a password. It also holds password hashes and
+keys: keep it out of this repository. The import copies none of them.
+
+Nothing is deployed by importing. It writes files in this folder and prints a
+report; read both, then commit as for any other change.
+
+| From OPNsense | Written as |
+| --- | --- |
+| Interfaces, VLANs, virtual addresses of the kind "IP alias", MTU and MAC address | `network/hostname.<interface>`, one each; a VLAN with number 10 is `vlan10` |
+| A fixed default gateway | `network/mygate` |
+| Aliases | `firewall/15-opnsense-aliases.conf`: an address alias is a table, `<name>`; a port alias is a macro, `$name` |
+| Port forwards, one-to-one NAT, outbound NAT, automatic or written by hand | `nat/25-opnsense.conf` |
+| Firewall rules, floating, of interface groups and of interfaces, in both of OPNsense's formats | `firewall/40-opnsense.conf` |
+| The DHCP server, whether ISC, Kea or dnsmasq: networks, ranges, options and fixed addresses | a marked part of `dhcp/dhcpd.conf` |
+| Unbound's host overrides and their aliases, domain overrides, forwarding, DNS over TLS, access lists and DNSSEC; or dnsmasq's host and domain overrides | `dns/unbound.conf` |
+
+Routing is switched on in `network/sysctl.conf`.
+
+**Port names.** OPNsense runs on FreeBSD, which names some ports differently:
+its `igb0` is OpenBSD's `em0`, its `vtnet0` is `vio0`. The import translates
+the driver and keeps the number, and the report lists every name it chose.
+That is a guess. Compare it with `ifconfig` on the OpenBSD machine, and say
+otherwise where it is wrong:
+
+```sh
+./fw import-opnsense --map igb0=em2 --map igb1=em3 config.xml
+```
+
+**How the rules are carried over.** OPNsense tries a packet against floating
+rules, then the rules of interface groups, then the interface's own, and stops
+at the first that matches. The imported rules are in that order and say
+`quick`, which makes PF stop in the same way; a floating rule that was not
+marked quick is written without. What no rule passes is dropped by the `block
+all` in `firewall/30-rules.conf`. `lan net` becomes `(em1:network)`, `lan
+address` becomes `(em1)`, and "This Firewall" becomes `(self)`. A rule that was
+switched off is written as a comment. A port forward becomes a `match` rule
+that only redirects, and the filter rule OPNsense kept beside it is what lets
+the connection in.
+
+Three things OPNsense does without being asked are written out: the
+anti-lockout rule, as SSH to the firewall from LAN; "block private networks"
+on an interface; and automatic outbound NAT, as one rule for each inside
+network.
+
+**What is left out is in the report.** A rule or a setting that cannot be
+written to mean the same is never written to mean something else: it is left
+out, named in the report, and, for a rule, left in the file as a comment
+starting `# NOT IMPORTED`. A block rule that is left out is marked as such,
+because without it more gets through than did before. Not imported at all:
+IPv6 addresses, PPPoE, link aggregation and bridges, VPNs, static routes,
+gateway groups, CARP, schedules, traffic shaping, blocklists and aliases that
+OPNsense fills from a download (their tables are created empty), names in an
+address alias, NAT reflection, and the newer formats of NAT rules.
+
+**Files you wrote are left alone.** The import's files start with a line
+saying so, and importing again replaces those and removes the ones no longer
+wanted. A file it would write that exists already and was not written by an
+import stops it; `--force` replaces such files. `firewall/30-rules.conf` is
+never touched. As this repository ships it, it lets SSH and ping in from
+anywhere, which OPNsense did not: narrow those once the deployment works.
+
+**The first deployment of an import replaces the firewall's addresses**,
+including that of the port the deployment arrives on. If the firewall can no
+longer be reached afterwards, it puts back what it had, as for any other
+change.
+
+The sample backup `tui/tests/opnsense-config.xml` is imported and deployed to
+OpenBSD 7.9 by `test/run`, which checks its DHCP, its rules and its resolver
+from a client. The older formats of aliases and of Unbound's settings, Kea and
+the newer rule format are covered by the unit tests only, which compare the
+lines written; dnsmasq's DHCP, one-to-one NAT and policy routing have not been
+run against OPNsense backups from a real installation at all.
+
 ## How a deployment works
 
 For each new commit on the branch, the deployer:
@@ -165,7 +291,8 @@ on the interfaces it found when it started. Emptying the file again stops
 `dhcpd`, switches it off and removes `/etc/dhcpd.conf`, but only if that file
 came from here. If the rules deploy but the DHCP configuration cannot be
 installed, the rules stay in place and the DHCP configuration is tried again
-on every pass.
+on every pass. The resolver in `dns/unbound.conf` is handled in the same way,
+after DHCP; see DNS.
 
 ## Setting it up
 
@@ -329,6 +456,8 @@ On the firewall, `target/reset.sh`:
 - replaces `/etc/pf.conf` with the rules OpenBSD is installed with,
   `/etc/examples/pf.conf`, and loads them;
 - removes `/etc/dhcpd.conf`, and stops and disables `dhcpd`;
+- if a resolver was deployed from here, stops and disables `unbound` and puts
+  back the `unbound.conf` OpenBSD came with;
 - leaves the network as it is. The interface files, `/etc/sysctl.conf` and
   `/etc/mygate` stay, because taking them away could leave the machine with no
   address to reach it on.
@@ -364,8 +493,8 @@ not been run against a server at all.
 
 The deployment account can run exactly one command as root, `fcc-pfctl`, with
 these operations: `status`, `validate`, `backup`, `arm <seconds>`, `apply`,
-`commit`, `rollback`, `net-validate`, `net-apply`, `dhcpd-apply`, and
-`dhcpd-remove`. Rules and network files are refused unless the watchdog is
+`commit`, `rollback`, `net-validate`, `net-apply`, `dhcpd-apply`,
+`dhcpd-remove`, `unbound-apply`, and `unbound-remove`. Rules and network files are refused unless the watchdog is
 armed. Every path in it is fixed, except that network files are installed as
 `/etc/hostname.<interface>`, `/etc/sysctl.conf` and `/etc/mygate`, within the
 limits listed under Networks.
@@ -380,7 +509,7 @@ push to the branch decides what the deployer does with the deployment key.
 Protect the branch accordingly.
 
 All of this is run against OpenBSD 7.9 by `test/run`: `./setup`, `fcc-gate`,
-the rules, the network files, DHCP, recovery from a deliberate lockout, and
+the rules, the network files, DHCP, the resolver, recovery from a deliberate lockout, and
 recovery from losing power between trying a change and keeping it. One thing
 is not: the watchdog taking over a stuck lock, which was only run against
 stand-ins for `pfctl` and `doas` on Linux.
@@ -503,14 +632,16 @@ on this computer: a firewall, and a client on a trunk behind it.
 
 ```sh
 test/vm build   # once: installs OpenBSD 7.9 under QEMU and keeps a clean copy
-test/run        # about five minutes
+test/run        # under ten minutes
 ```
 
 `test/run` puts both machines back to the clean install, sets the firewall up
 with `./setup`, and deploys to it the way the deployer does. It then checks
 that a client gets an address by DHCP on two VLANs, reaches the internet
-through NAT, and cannot cross from one VLAN to the other; that the helper
-turns down network files that could run commands; and that the firewall
+through NAT, and cannot cross from one VLAN to the other; that an imported
+OPNsense backup deploys and behaves as its rules say; that the helper turns
+down network files that could run commands and resolver settings that could
+reach other files; and that the firewall
 recovers from a VLAN that cannot come up, from its management port being taken
 down, and from losing power halfway through a change.
 

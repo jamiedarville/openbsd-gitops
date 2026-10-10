@@ -22,6 +22,7 @@
     pf_file: "{{ work }}/pf.conf"
     net_file: "{{ work }}/network.conf"
     dhcp_file: "{{ repo }}/dhcp/dhcpd.conf"
+    dns_file: "{{ repo }}/dns/unbound.conf"
     # What a firewall with no network files from here reports.
     no_network: "sha256:{{ '# openbsd-gitops network\n' | hash('sha256') }}"
 
@@ -242,5 +243,58 @@
           ansible.builtin.fail:
             msg: >-
               The firewall rules are deployed, but the DHCP configuration was not installed:
+              "{{ ansible_failed_task.name }}" failed.
+              {{ ansible_failed_result.stderr | default(ansible_failed_result.msg | default(''), true) }}
+
+    # A repository from before the resolver has no such file; that counts as
+    # one with nothing in it.
+    - name: Check whether there is a resolver configuration to deploy
+      ansible.builtin.shell: grep -Eqv '^[[:space:]]*(#|$)' {{ dns_file | quote }}
+      register: dns_active
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy the resolver configuration
+      block:
+        - name: Work out the digest of the resolver configuration
+          ansible.builtin.stat:
+            path: "{{ dns_file }}"
+            checksum_algorithm: sha256
+          register: dns_stat
+          when: dns_active.rc == 0
+
+        - name: Stop if the firewall's helper is too old for a resolver
+          ansible.builtin.assert:
+            that: before.unbound_sha256 is defined
+            fail_msg: The helper installed on the firewall does not support a resolver. Reinstall target/fcc-pfctl.
+          when: dns_active.rc == 0
+
+        # Also when the file is the same but unbound is not running, or the
+        # network changed: unbound only listens on the addresses it started with.
+        - name: Install the resolver configuration and start unbound
+          ansible.builtin.shell: "{{ helper | quote }} unbound-apply < {{ dns_file | quote }}"
+          when: >-
+            dns_active.rc == 0 and
+            (before.unbound_sha256 != 'sha256:' + dns_stat.stat.checksum
+            or before.unbound | default('running') != 'running'
+            or (net_changed | bool))
+
+        # Only a configuration that came from here is ever taken away.
+        - name: Remove the resolver configuration and stop unbound
+          ansible.builtin.command: "{{ helper }} unbound-remove"
+          when: dns_active.rc != 0 and before.unbound_managed | default('0') == '1'
+
+      rescue:
+        # Read by the deployer, as for DHCP: this failure is retried.
+        - name: Note that only the resolver configuration failed
+          ansible.builtin.file:
+            path: "{{ work }}/dns-failed"
+            state: touch
+            mode: "0600"
+
+        - name: Report the failed resolver deployment
+          ansible.builtin.fail:
+            msg: >-
+              The firewall rules are deployed, but the resolver configuration was not installed:
               "{{ ansible_failed_task.name }}" failed.
               {{ ansible_failed_result.stderr | default(ansible_failed_result.msg | default(''), true) }}

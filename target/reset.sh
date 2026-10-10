@@ -8,7 +8,9 @@
 # lines in /etc/doas.conf and /etc/rc.local, and everything the helper kept. It
 # replaces
 # /etc/pf.conf with the rules OpenBSD is installed with, /etc/examples/pf.conf,
-# and loads them. It removes /etc/dhcpd.conf, and stops and disables dhcpd.
+# and loads them. It removes /etc/dhcpd.conf, and stops and disables dhcpd; a
+# resolver configuration deployed from here makes way for OpenBSD's own, and
+# unbound is stopped and disabled.
 #
 # The rules OpenBSD is installed with pass everything and do no NAT: networks
 # behind the firewall lose their way out, and nothing is filtered any more.
@@ -88,6 +90,18 @@ if [ -f /etc/dhcpd.conf ]; then
 	rcctl disable dhcpd
 fi
 rm -f /etc/dhcpd.conf /etc/dhcpd.conf.fcc-previous /etc/dhcpd.conf.fcc-new
+
+# The resolver, if its configuration came from here: OpenBSD's own is put back.
+if [ -f /var/db/fcc/unbound-managed ]; then
+	if rcctl check unbound >/dev/null 2>&1; then
+		rcctl stop unbound >/dev/null
+	fi
+	rcctl disable unbound
+	if [ -f /var/unbound/etc/unbound.conf.fcc-original ]; then
+		mv -f /var/unbound/etc/unbound.conf.fcc-original /var/unbound/etc/unbound.conf
+	fi
+fi
+rm -f /var/unbound/etc/unbound.conf.fcc-previous /var/unbound/etc/unbound.conf.fcc-new
 
 rm -rf /var/db/fcc /var/run/fcc
 

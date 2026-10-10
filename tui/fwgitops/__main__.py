@@ -6,6 +6,9 @@
     fw check      ask the firewall to check the rules and the network files;
                   changes nothing
     fw status     compare this folder with what the firewall is running
+    fw import-opnsense [-n] [--force] [--map igb0=em0 ...] config.xml
+                  write this folder's files from an OPNsense backup, and say
+                  what could not be brought across; -n only says
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from . import remote, rules
+from . import opnsense, remote, rules
 
 
 def find_root(start: Path) -> Path:
@@ -21,6 +24,37 @@ def find_root(start: Path) -> Path:
         if (directory / remote.CONFIG_FILE).exists():
             return directory
     sys.exit(f"No {remote.CONFIG_FILE} found here or in a parent folder.")
+
+
+def import_opnsense(root: Path, arguments: list[str]) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="fw import-opnsense", description="Writes this folder's files from an OPNsense backup.")
+    parser.add_argument("backup", type=Path, help="the config.xml downloaded from OPNsense")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="say what would be written, and write nothing")
+    parser.add_argument("--force", action="store_true", help="replace files that were not written by an import")
+    parser.add_argument("--map", action="append", default=[], metavar="OLD=NEW", help="the OpenBSD name of an OPNsense port, such as igb0=em2")
+    options = parser.parse_args(arguments)
+    device_map = {}
+    for pair in options.map:
+        old, equals, new = pair.partition("=")
+        try:
+            device_map[old.strip()] = rules.check_port(new) if equals and old.strip() else rules.check_port("")
+        except rules.InvalidInput:
+            print(f"--map {pair}: write it like igb0=em2", file=sys.stderr)
+            return 64
+    try:
+        result = opnsense.plan(root, options.backup.read_bytes(), device_map, options.force, options.dry_run)
+    except OSError as problem:
+        print(f"Could not read the backup: {problem}", file=sys.stderr)
+        return 1
+    except opnsense.ImportFailed as problem:
+        print(problem, file=sys.stderr)
+        return 1
+    if not options.dry_run:
+        opnsense.write(root, result)
+    sys.stdout.write(result.report)
+    return 0
 
 
 def main(arguments: list[str]) -> int:
@@ -38,6 +72,8 @@ def main(arguments: list[str]) -> int:
     if command == "assemble-network":
         sys.stdout.write(rules.assemble_network(root))
         return 0
+    if command == "import-opnsense":
+        return import_opnsense(root, arguments[1:])
     if command == "check":
         firewall = remote.load_firewall(root)
         checks = [("validate", rules.assemble_pf(root))]

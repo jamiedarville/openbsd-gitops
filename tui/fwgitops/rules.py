@@ -19,6 +19,7 @@ SETTINGS_FILE = Path("firewall/10-settings.conf")
 RULES_FILE = Path("firewall/30-rules.conf")
 NAT_FILE = Path("nat/20-nat.conf")
 DHCP_FILE = Path("dhcp/dhcpd.conf")
+DNS_FILE = Path("dns/unbound.conf")
 # The folder whose files are installed in /etc on the firewall, under the same
 # names: hostname.<interface>, sysctl.conf and mygate.
 NETWORK_FOLDER = Path("network")

@@ -11,7 +11,8 @@
 #
 # firewall runs target/reset.sh on the firewall: the fccdeploy account, the
 # helper and its doas rule go, /etc/pf.conf goes back to the rules OpenBSD is
-# installed with, and /etc/dhcpd.conf goes.
+# installed with, /etc/dhcpd.conf goes, and a resolver deployed from here is
+# stopped.
 #
 # monitoring runs monitoring/reset.sh on the monitoring server: the fccmon
 # account, the stack and its data, and the host firewall go. -d removes Docker
@@ -77,6 +78,8 @@ if [ "$what" = firewall ]; then
 	echo "    They pass everything and do no NAT: networks behind the firewall lose their"
 	echo "    way out, and nothing is filtered any more"
 	echo "  - remove /etc/dhcpd.conf, and stop and disable dhcpd"
+	echo "  - put back the unbound.conf OpenBSD came with, and stop and disable unbound,"
+	echo "    if a resolver was deployed from here"
 	echo "  - leave the network as it is: the interface files, /etc/sysctl.conf and"
 	echo "    /etc/mygate stay, so the machine keeps the addresses it is reached on"
 else
